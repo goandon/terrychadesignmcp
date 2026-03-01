@@ -2440,6 +2440,7 @@ def generate_pose_sheet(
     model: str = DEFAULT_MODEL,
     image_size: str = "512px",
     person_generation: Optional[str] = "ALLOW_ALL",
+    prominent_people: Optional[str] = None,
     temperature: Optional[float] = None,
     seed: Optional[int] = None,
     safety_level: Optional[str] = "BLOCK_NONE",
@@ -2473,6 +2474,7 @@ def generate_pose_sheet(
         model: "flash" (default) or "pro". Flash recommended for 512px.
         image_size: "512px" (default) for speed, "1K" for higher quality.
         person_generation: Default: "ALLOW_ALL".
+        prominent_people: "ALLOW" or "DENY" for celebrity generation.
         temperature: 0.0-2.0. Recommended: 0.5-0.8.
         seed: Fixed seed for reproducibility.
         safety_level: Safety filter threshold.
@@ -2593,6 +2595,7 @@ def generate_pose_sheet(
             image_size=image_size,
             number_of_images=1,
             person_generation=person_generation,
+            prominent_people=prominent_people,
             temperature=temperature,
             seed=seed,
             safety_level=safety_level,
@@ -2691,6 +2694,7 @@ def generate_chat_emoji(
     model: str = DEFAULT_MODEL,
     image_size: str = "512px",
     person_generation: Optional[str] = "ALLOW_ALL",
+    prominent_people: Optional[str] = None,
     temperature: Optional[float] = None,
     seed: Optional[int] = None,
     safety_level: Optional[str] = "BLOCK_NONE",
@@ -2726,6 +2730,7 @@ def generate_chat_emoji(
         model: "flash" (default) or "pro".
         image_size: Generation size. Default: "512px".
         person_generation: Default: "ALLOW_ALL".
+        prominent_people: "ALLOW" or "DENY" for celebrity generation.
         temperature: 0.0-2.0. Recommended: 0.5-0.8.
         seed: Fixed seed for reproducibility.
         safety_level: Safety filter threshold.
@@ -2842,6 +2847,7 @@ def generate_chat_emoji(
             image_size=image_size,
             number_of_images=1,
             person_generation=person_generation,
+            prominent_people=prominent_people,
             temperature=temperature,
             seed=seed,
             safety_level=safety_level,
