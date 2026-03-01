@@ -13,7 +13,7 @@ Author: Terry.Kim <goandonh@gmail.com>
 Co-Author: Claudie
 """
 
-__version__ = "0.3.0"
+__version__ = "0.3.1"
 
 import os
 import json
@@ -80,6 +80,14 @@ VALID_SAFETY_LEVELS = {
     "BLOCK_NONE",
 }
 VALID_OUTPUT_FORMATS = {"file", "base64"}
+
+# Anti-overlay instruction — prevents model from rendering text, labels, or swatches
+NO_OVERLAY_INSTRUCTION = (
+    " IMPORTANT: Generate ONLY the character illustration. "
+    "Do NOT add any text, labels, annotations, captions, arrows, "
+    "color palette swatches, or detail inset boxes on the image. "
+    "The output must be a clean image with no overlaid graphics or text of any kind."
+)
 
 # ---------------------------------------------------------------------------
 # Safety Filter Retry Configuration
@@ -195,7 +203,7 @@ SHOT_DEFINITIONS = {
 # Placeholders: {character}, {outfit}, {expression}, {background}, {style}, {color_palette}
 SHOT_PROMPTS = {
     "full_body_front": (
-        "Full body front view character reference sheet of {character}. "
+        "Full body front view portrait of {character}. "
         "{outfit}. "
         "Standing in a relaxed neutral pose, facing the camera directly, "
         "arms slightly away from body to show full outfit details. "
@@ -204,11 +212,11 @@ SHOT_PROMPTS = {
         "{color_palette}"
         "{background}. "
         "{style} style. "
-        "Professional character design reference sheet, clean lines, "
-        "high detail, consistent proportions."
+        "Clean illustration, high detail, consistent proportions."
+        + NO_OVERLAY_INSTRUCTION
     ),
     "full_body_left": (
-        "Full body left side view character reference of {character}. "
+        "Full body left side view portrait of {character}. "
         "{outfit}. "
         "Standing in a neutral pose, viewed from the left side in perfect profile. "
         "Character's left arm, left leg, and left side of face visible. "
@@ -217,11 +225,11 @@ SHOT_PROMPTS = {
         "{color_palette}"
         "{background}. "
         "{style} style. "
-        "Character design reference sheet, consistent with the front view, "
-        "showing left side silhouette and profile details."
+        "Consistent with the front view, showing left side silhouette and profile details."
+        + NO_OVERLAY_INSTRUCTION
     ),
     "full_body_right": (
-        "Full body right side view character reference of {character}. "
+        "Full body right side view portrait of {character}. "
         "{outfit}. "
         "Standing in a neutral pose, viewed from the right side in perfect profile. "
         "Character's right arm, right leg, and right side of face visible. "
@@ -230,11 +238,11 @@ SHOT_PROMPTS = {
         "{color_palette}"
         "{background}. "
         "{style} style. "
-        "Character design reference sheet, consistent with the front view, "
-        "showing right side silhouette and profile details."
+        "Consistent with the front view, showing right side silhouette and profile details."
+        + NO_OVERLAY_INSTRUCTION
     ),
     "full_body_back": (
-        "Full body back view character reference of {character}. "
+        "Full body back view portrait of {character}. "
         "{outfit}. "
         "Standing in a neutral pose, facing directly away from the camera. "
         "Full body visible from head to feet, showing back of clothing and hair. "
@@ -242,8 +250,8 @@ SHOT_PROMPTS = {
         "{color_palette}"
         "{background}. "
         "{style} style. "
-        "Character design reference sheet, consistent with the front view, "
-        "showing back details of outfit and hairstyle."
+        "Consistent with the front view, showing back details of outfit and hairstyle."
+        + NO_OVERLAY_INSTRUCTION
     ),
     "face_left": (
         "Close-up face portrait in left side profile of {character}. "
@@ -254,11 +262,11 @@ SHOT_PROMPTS = {
         "{color_palette}"
         "{background}. "
         "{style} style. "
-        "Character design face reference sheet, high detail, "
-        "showing left facial profile and structure."
+        "High detail, showing left facial profile and structure."
+        + NO_OVERLAY_INSTRUCTION
     ),
     "face_front": (
-        "Close-up face portrait character reference of {character}. "
+        "Close-up face portrait of {character}. "
         "Detailed facial features visible: eyes, nose, mouth, eyebrows, ears. "
         "Front view facing the camera directly. "
         "Expression: {expression}. "
@@ -266,8 +274,8 @@ SHOT_PROMPTS = {
         "{color_palette}"
         "{background}. "
         "{style} style. "
-        "Character design face reference sheet, high detail, "
-        "showing skin texture, eye color, and facial structure."
+        "High detail, showing skin texture, eye color, and facial structure."
+        + NO_OVERLAY_INSTRUCTION
     ),
     "face_right": (
         "Close-up face portrait in right side profile of {character}. "
@@ -278,11 +286,11 @@ SHOT_PROMPTS = {
         "{color_palette}"
         "{background}. "
         "{style} style. "
-        "Character design face reference sheet, high detail, "
-        "showing right facial profile and structure."
+        "High detail, showing right facial profile and structure."
+        + NO_OVERLAY_INSTRUCTION
     ),
     "upper_body": (
-        "Upper body close-up character reference of {character}. "
+        "Upper body close-up portrait of {character}. "
         "{outfit}. "
         "Framed from waist up, facing the camera, showing clothing details "
         "and accessories on the upper body. "
@@ -290,8 +298,8 @@ SHOT_PROMPTS = {
         "{color_palette}"
         "{background}. "
         "{style} style. "
-        "Character design reference sheet, consistent with the full body front view, "
-        "high detail on face and upper body features."
+        "Consistent with the full body front view, high detail on face and upper body."
+        + NO_OVERLAY_INSTRUCTION
     ),
 }
 
@@ -509,7 +517,8 @@ POSE_PROMPT_TEMPLATE = (
     "{color_palette}"
     "{background}. "
     "{style} style. "
-    "Character pose reference, clean lines, consistent proportions."
+    "Clean illustration, consistent proportions."
+    + NO_OVERLAY_INSTRUCTION
 )
 
 # ---------------------------------------------------------------------------
@@ -718,7 +727,9 @@ CHIBI_STYLE_PREFIX = (
     "2-3 head-to-body ratio, oversized head, large expressive eyes, "
     "small body, simplified hands and feet, cute exaggerated proportions. "
     "Single character centered on frame. "
-    "Clean bold outlines, flat vibrant colors, sticker-ready design. "
+    "Clean bold outlines, flat vibrant colors, sticker-ready design."
+    + NO_OVERLAY_INSTRUCTION
+    + " "
 )
 
 # Consistency prefix adapted for chibi transformation
@@ -1460,7 +1471,7 @@ def _build_character_prompt(
     if accessories:
         parts.append(f"Wearing accessories: {accessories}")
     if distinguishing_features:
-        parts.append(f"Distinguishing features: {distinguishing_features}")
+        parts.append(distinguishing_features)
 
     character_block = ". ".join(parts)
 
@@ -1471,7 +1482,7 @@ def _build_character_prompt(
         expression=expression or "neutral, calm",
         background=background_description or DEFAULT_BACKGROUND,
         style=style,
-        color_palette=f"Color palette: {color_palette}. " if color_palette else "",
+        color_palette=f"Use a {color_palette} color scheme. " if color_palette else "",
     )
 
 
@@ -2580,7 +2591,7 @@ def generate_pose_sheet(
             pose_prompt=pose_def["prompt"],
             style=style,
             background=background_description or DEFAULT_BACKGROUND,
-            color_palette=f"Color palette: {color_palette}. " if color_palette else "",
+            color_palette=f"Use a {color_palette} color scheme. " if color_palette else "",
         )
 
         full_prompt = CONSISTENCY_PREFIX + pose_prompt

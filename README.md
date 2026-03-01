@@ -13,6 +13,7 @@ An MCP server that generates consistent character reference image sets using Goo
 - **Pose sample sheet**: Pre-defined pose categories (daily life, action, emotion, social) with auto grid composite
 - **SD chat emoji**: Generate chibi/SD character emoji stickers for Telegram, Discord, LINE, KakaoTalk, Slack, WhatsApp
 - **Prompt dictionary**: Curated reference vocabulary for character design prompts (13 categories)
+- **Clean image output**: Anti-overlay prompting prevents text labels, color swatches, and annotation insets
 - **Safety filter retry**: Automatic retry with softened prompts when safety filters block generation
 - **Cost estimation**: Pre-generation cost calculator for budgeting API expenses
 
@@ -381,6 +382,17 @@ With `both_sides=True`, `full_body_right` is added as a 4th body column.
 | `GOOGLE_GENAI_USE_VERTEXAI` | `true` | Use Vertex AI auth |
 | `GEMINI_API_KEY` | | API key (non-Vertex mode) |
 
+## Clean Image Output (Anti-Overlay)
+
+All prompt templates include `NO_OVERLAY_INSTRUCTION` to prevent AI models from rendering unwanted visual elements on generated images:
+
+- Text labels and annotations (e.g., "Normal human ears", "Wavy hair")
+- Color palette swatches
+- Detail inset/zoom boxes
+- Arrows or callout graphics
+
+This is applied automatically to all generation tools (`design_character`, `add_character_pose`, `generate_pose_sheet`, `generate_chat_emoji`). No user configuration needed.
+
 ## Safety Filter Retry
 
 All generation tools include automatic retry on safety filter blocks:
@@ -410,6 +422,7 @@ Use `estimate_generation_cost` to check worst-case costs (all retries used) befo
 10. **Use `generate_chat_emoji`** to create platform-ready chat stickers from your character
 11. **Use `estimate_generation_cost`** before large batch operations to budget API costs
 12. **Set `on_block="stop"`** during testing to fail fast instead of wasting retries
+13. **Avoid label-like descriptions** — use "has freckles on nose" instead of "Distinguishing features: freckles" to prevent text overlay
 
 ## License
 
