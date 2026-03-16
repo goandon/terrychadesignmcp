@@ -3928,12 +3928,12 @@ def suggest_outfits(
     # Category slots for outfit assembly
     CONCEPT_CATEGORIES = {
         "casual": ["top", "bottom", "shoes"],
-        "street": ["top", "bottom", "outerwear", "shoes"],
-        "formal": ["top", "bottom", "shoes", "accessories"],
+        "street": ["top", "bottom", "outer", "shoes"],
+        "formal": ["top", "bottom", "shoes", "accessory"],
         "sporty": ["top", "bottom", "shoes"],
-        "date": ["top", "bottom", "shoes", "accessories"],
+        "date": ["top", "bottom", "shoes", "accessory"],
         "minimal": ["top", "bottom", "shoes"],
-        "cozy": ["top", "outerwear", "bottom", "shoes"],
+        "cozy": ["top", "outer", "bottom", "shoes"],
     }
 
     categories = CONCEPT_CATEGORIES.get(concept, ["top", "bottom", "shoes"])
@@ -3945,13 +3945,12 @@ def suggest_outfits(
         items = []
         for cat in categories:
             # Build query with brand affinity
-            query = "SELECT product_id, brand, name, price, colors, fit, local_image_path FROM products WHERE 1=1"
+            query = "SELECT product_id, brand, name, price, colors, materials, local_image_path FROM products WHERE 1=1"
             params = []
 
-            # Category filter (loose match on name/category fields)
-            if cat in ("top", "bottom", "outerwear", "shoes", "accessories"):
-                query += " AND (category LIKE ? OR sub_category LIKE ?)"
-                params.extend([f"%{cat}%", f"%{cat}%"])
+            # Category filter (exact match on category field)
+            query += " AND category = ?"
+            params.append(cat)
 
             # Brand affinity (prefer profile brands but don't require)
             if brand_vibe:
