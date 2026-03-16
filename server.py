@@ -16,6 +16,7 @@ Co-Author: Claudie
 __version__ = "0.4.0"
 
 import os
+import sys
 import json
 import base64
 import uuid
@@ -45,6 +46,39 @@ def _get_profile_manager() -> ProfileManager:
     if _profile_manager is None:
         _profile_manager = ProfileManager()
     return _profile_manager
+
+
+# --- Cross-platform NAS path mapping ---
+# Single source of truth: profiles store macOS paths.
+# On Windows, auto-convert /Volumes/NAS_Data/ <-> X:/ (SMB mount).
+_NAS_PATH_MAP = {
+    "macos": "/Volumes/NAS_Data/",
+    "windows": "X:/",
+    "unc": "//192.168.0.2/Data_Vol1/",
+}
+
+
+def _convert_nas_path(path_str: str) -> str:
+    """Convert NAS path to current platform equivalent."""
+    is_windows = sys.platform == "win32"
+    if is_windows:
+        # macOS -> Windows
+        if path_str.startswith(_NAS_PATH_MAP["macos"]):
+            return path_str.replace(_NAS_PATH_MAP["macos"], _NAS_PATH_MAP["windows"], 1)
+    else:
+        # Windows -> macOS
+        if path_str.startswith(_NAS_PATH_MAP["windows"]):
+            return path_str.replace(_NAS_PATH_MAP["windows"], _NAS_PATH_MAP["macos"], 1)
+        # UNC -> macOS
+        for unc_prefix in (_NAS_PATH_MAP["unc"], _NAS_PATH_MAP["unc"].replace("/", "\\")):
+            if path_str.startswith(unc_prefix):
+                return path_str.replace(unc_prefix, _NAS_PATH_MAP["macos"], 1)
+    return path_str
+
+
+def _convert_nas_paths(paths: list[str]) -> list[str]:
+    """Convert a list of NAS paths to current platform."""
+    return [_convert_nas_path(p) for p in paths]
 
 
 def _resolve_product_input(product_ids=None, product_id=None, product_query=None):
@@ -2238,6 +2272,10 @@ def design_character(
         if reference_images is None:
             reference_images = profile_params.get("reference_images")
 
+    # Convert NAS paths for cross-platform compatibility
+    if reference_images:
+        reference_images = _convert_nas_paths(reference_images)
+
     # Ensure required parameters have values after profile loading
     if not character_description:
         return json.dumps({"error": "character_description is required (provide directly or via profile)"})
@@ -2669,6 +2707,8 @@ def add_character_pose(
     if errors:
         return json.dumps({"errors": errors})
 
+    reference_images = _convert_nas_paths(reference_images)
+
     max_refs = 10 if model.lower() == "flash" else 14
     if len(reference_images) > max_refs:
         return json.dumps({
@@ -2876,6 +2916,8 @@ def generate_pose_sheet(
     # Validate reference images
     if not reference_images:
         return json.dumps({"error": "At least one reference image is required."})
+
+    reference_images = _convert_nas_paths(reference_images)
 
     max_refs = 10 if model.lower() == "flash" else 14
     if len(reference_images) > max_refs:
@@ -3138,6 +3180,8 @@ def generate_chat_emoji(
     # Validate reference images
     if not reference_images:
         return json.dumps({"error": "At least one reference image is required."})
+
+    reference_images = _convert_nas_paths(reference_images)
 
     max_refs = 10 if model.lower() == "flash" else 14
     if len(reference_images) > max_refs:

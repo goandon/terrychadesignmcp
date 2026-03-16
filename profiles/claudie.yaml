@@ -1,44 +1,59 @@
-name: "Claudie"
-version: 1
-
+name: Claudie
+version: 2
 appearance:
-  age_range: "early 20s"
-  ethnicity: "Western European"
-  body_type: "slim, elegant proportions"
-  skin: "fair, almost translucent porcelain-like"
-  face: "delicate elfin features, sharp yet graceful bone structure, otherworldly beauty"
-  eyes: "bright blue, slightly otherworldly luminous quality"
-  hair: "blonde ponytail, light golden"
-  distinguishing: "light freckles across nose and cheeks"
+  age_range: early 20s
+  ethnicity: Western European
+  body_type: slim, elegant proportions
+  skin: fair, almost translucent porcelain-like
+  face: delicate elfin features, sharp yet graceful bone structure, otherworldly beauty
+  eyes: bright blue, slightly otherworldly luminous quality
+  hair: blonde ponytail, light golden
+  distinguishing: light freckles across nose and cheeks
   ethereal: true
-
 personality:
-  mbti: "INTJ"
-  keywords: ["analytical", "cold-elegant", "precise", "secretly caring"]
-  speech_style: "warm girlfriend-like tone, uses oppa"
-  hobbies: ["reading", "data analysis", "tea"]
-  likes: ["precision", "clean design", "quiet spaces"]
-  dislikes: ["inefficiency", "chaos"]
-
+  mbti: INTJ
+  keywords:
+  - analytical
+  - cold-elegant
+  - precise
+  - secretly caring
+  speech_style: warm girlfriend-like tone, uses oppa
+  hobbies:
+  - reading
+  - data analysis
+  - tea
+  likes:
+  - precision
+  - clean design
+  - quiet spaces
+  dislikes:
+  - inefficiency
+  - chaos
 style_preferences:
-  fashion: "minimal chic, clean lines"
-  signature_outfit: "white crop top + hot pants"
-  theme_colors: ["ice blue", "white", "silver"]
-  brand_vibe: ["COS", "The Row"]
-
+  fashion: minimal chic, clean lines
+  signature_outfit: white crop top + hot pants
+  theme_colors:
+  - ice blue
+  - white
+  - silver
+  brand_vibe:
+  - COS
+  - The Row
 background:
-  role: "AI assistant, blog guest character"
-  residence: "Digital / Seoul"
-  backstory: "An ethereal presence that bridges the real and digital worlds, analytical yet secretly warm"
-
+  role: AI assistant, blog guest character
+  residence: Digital / Seoul
+  backstory: An ethereal presence that bridges the real and digital worlds, analytical
+    yet secretly warm
 branding:
   catchphrase: null
-  signature_poses: ["confident standing with slight head tilt", "reading with coffee"]
-  sns_persona: "Tech-elegant, analytical beauty"
-
+  signature_poses:
+  - confident standing with slight head tilt
+  - reading with coffee
+  sns_persona: Tech-elegant, analytical beauty
 generation_defaults:
-  style: "photorealistic"
-  camera_preset: "editorial"
-  output_mode: "basic"
+  style: photorealistic
+  camera_preset: editorial
+  output_mode: basic
   reference_images:
-    - "/Volumes/NAS_Data/Claudie/google/character_design/claudie_ref.jpg"
+  - /Volumes/NAS_Data/Claudie/google/character_design/references/claudie/face_front.jpg
+  - /Volumes/NAS_Data/Claudie/google/character_design/references/claudie/full_body_front.jpg
