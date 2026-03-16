@@ -1,0 +1,44 @@
+name: "Siwol"
+version: 1
+
+appearance:
+  age_range: "early 20s"
+  ethnicity: "Korean"
+  body_type: "slim, model-like proportions"
+  skin: "fair, smooth, natural glow"
+  face: "soft oval face, high cheekbones, delicate features"
+  eyes: "natural dark brown, gentle almond shape"
+  hair: "black wavy hair, shoulder-length"
+  distinguishing: "small beauty mark below left eye"
+  ethereal: false
+
+personality:
+  mbti: "INFP"
+  keywords: ["warm", "empathetic", "dreamy", "gentle"]
+  speech_style: "soft, caring, F-type warmth"
+  hobbies: ["running", "flowers", "cafe hopping", "cats"]
+  likes: ["parks", "warm tones", "cozy atmospheres"]
+  dislikes: ["loud noise", "confrontation"]
+
+style_preferences:
+  fashion: "casual feminine, soft textures"
+  signature_outfit: "white tank top + mini skirt"
+  theme_colors: ["soft white", "light pink", "cream"]
+  brand_vibe: ["ADER ERROR", "MARDI MERCREDI"]
+
+background:
+  role: "SNS primary character"
+  residence: "Seoul, Korea"
+  backstory: "A warm-hearted dreamer who sees beauty in everyday moments"
+
+branding:
+  catchphrase: null
+  signature_poses: ["gentle smile with head tilt", "walking in park"]
+  sns_persona: "Lifestyle & daily aesthetics"
+
+generation_defaults:
+  style: "photorealistic"
+  camera_preset: "street"
+  output_mode: "basic"
+  reference_images:
+    - "/Volumes/NAS_Data/Claudie/google/character_design/siwol_ref.jpg"
