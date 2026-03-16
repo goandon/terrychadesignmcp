@@ -13,7 +13,7 @@ Author: Terry.Kim <goandonh@gmail.com>
 Co-Author: Claudie
 """
 
-__version__ = "0.3.1"
+__version__ = "0.4.0"
 
 import os
 import json
@@ -35,6 +35,7 @@ from presets import (
 )
 from prompts import build_prompt
 from profile_manager import ProfileManager
+from design_db import DesignDB
 
 _UNSET = object()  # Sentinel for distinguishing "not provided" from None
 
@@ -44,6 +45,30 @@ def _get_profile_manager() -> ProfileManager:
     if _profile_manager is None:
         _profile_manager = ProfileManager()
     return _profile_manager
+
+
+def _resolve_product_input(product_ids=None, product_id=None, product_query=None):
+    """Resolve product input by priority: product_ids > product_id > product_query."""
+    if product_ids is not None:
+        return ("product_ids", product_ids)
+    elif product_id is not None:
+        return ("product_id", product_id)
+    elif product_query is not None:
+        return ("product_query", product_query)
+    else:
+        raise ValueError(
+            "At least one product selection method must be provided: "
+            "product_ids, product_id, or product_query"
+        )
+
+
+_design_db = None
+def _get_design_db() -> DesignDB:
+    """Lazy-initialize the DesignDB singleton."""
+    global _design_db
+    if _design_db is None:
+        _design_db = DesignDB()
+    return _design_db
 
 # ---------------------------------------------------------------------------
 # Configuration (reused from terrymcpnanobanana)
@@ -2460,6 +2485,34 @@ def design_character(
                 **extracted,
             }
 
+            # Auto-record to design history
+            try:
+                _db = _get_design_db()
+                _concept_id = None
+                if concept:
+                    _concept_id = _db.resolve_concept(concept, character_name)
+                _saved_path = ""
+                if extracted.get("images"):
+                    _first = extracted["images"][0]
+                    _saved_path = _first.get("path", "")
+                if _saved_path:
+                    _db.record_generation(
+                        character_name=character_name,
+                        profile_name=profile,
+                        concept_id=_concept_id,
+                        tool="design_character",
+                        style=style,
+                        camera_preset=camera_preset,
+                        output_mode=output_mode,
+                        prompt=shot_prompt,
+                        model=model,
+                        image_size=image_size,
+                        shot_type=shot_type,
+                        image_path=_saved_path,
+                    )
+            except Exception:
+                pass  # Don't fail generation if DB recording fails
+
         except Exception as e:
             results[shot_type] = {
                 "status": "failed",
@@ -2685,6 +2738,27 @@ def add_character_pose(
         result["settings"]["temperature"] = temperature
     if seed is not None:
         result["settings"]["seed"] = seed
+
+    # Auto-record to design history
+    try:
+        _db = _get_design_db()
+        _saved_path = ""
+        if extracted.get("images"):
+            _first = extracted["images"][0]
+            _saved_path = _first.get("path", "")
+        if _saved_path:
+            _db.record_generation(
+                character_name=character_name or "unknown",
+                tool="add_character_pose",
+                style=style,
+                prompt=prompt,
+                model=model,
+                image_size=image_size,
+                shot_type="custom_pose",
+                image_path=_saved_path,
+            )
+    except Exception:
+        pass  # Don't fail generation if DB recording fails
 
     return json.dumps(result, ensure_ascii=False, indent=2)
 
@@ -3757,6 +3831,386 @@ def list_character_profiles(limit: int = 50) -> str:
     pm = _get_profile_manager()
     profiles = pm.list_profiles(limit=limit)
     return json.dumps({"profiles": profiles, "count": len(profiles)}, indent=2)
+
+
+@mcp.tool()
+def suggest_outfits(
+    profile: str,
+    concept: str,
+) -> str:
+    """Suggest 3 coordinated outfits based on character profile and styling concept.
+
+    Args:
+        profile: Character profile name (e.g., "siwol", "claudie").
+        concept: Styling concept - one of: casual, street, formal, sporty, date, minimal, cozy.
+    """
+    import sqlite3
+    import random
+
+    VALID_CONCEPTS = {"casual", "street", "formal", "sporty", "date", "minimal", "cozy"}
+    if concept not in VALID_CONCEPTS:
+        return json.dumps({"error": f"Invalid concept '{concept}'. Valid: {sorted(VALID_CONCEPTS)}"})
+
+    # Load profile
+    pm = _get_profile_manager()
+    try:
+        prof = pm.get(profile)
+    except FileNotFoundError as e:
+        return json.dumps({"error": str(e)})
+
+    style_prefs = prof.get("style_preferences", {})
+    theme_colors = style_prefs.get("theme_colors", [])
+    brand_vibe = style_prefs.get("brand_vibe", [])
+
+    # Connect to catalog.db
+    db_path = os.environ.get("PRODUCT_CATALOG_DB")
+    if not db_path:
+        return json.dumps({"error": "Product catalog database not found. Set PRODUCT_CATALOG_DB environment variable."})
+
+    if not Path(db_path).exists():
+        return json.dumps({"error": f"Product catalog database not found at {db_path}. Set PRODUCT_CATALOG_DB environment variable."})
+
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+
+    # Category slots for outfit assembly
+    CONCEPT_CATEGORIES = {
+        "casual": ["top", "bottom", "shoes"],
+        "street": ["top", "bottom", "outerwear", "shoes"],
+        "formal": ["top", "bottom", "shoes", "accessories"],
+        "sporty": ["top", "bottom", "shoes"],
+        "date": ["top", "bottom", "shoes", "accessories"],
+        "minimal": ["top", "bottom", "shoes"],
+        "cozy": ["top", "outerwear", "bottom", "shoes"],
+    }
+
+    categories = CONCEPT_CATEGORIES.get(concept, ["top", "bottom", "shoes"])
+
+    # Query products per category
+    proposals = []
+
+    for option_idx, option_label in enumerate(["A", "B", "C"]):
+        items = []
+        for cat in categories:
+            # Build query with brand affinity
+            query = "SELECT product_id, brand, name, price, colors, fit, local_image_path FROM products WHERE 1=1"
+            params = []
+
+            # Category filter (loose match on name/category fields)
+            if cat in ("top", "bottom", "outerwear", "shoes", "accessories"):
+                query += " AND (category LIKE ? OR sub_category LIKE ?)"
+                params.extend([f"%{cat}%", f"%{cat}%"])
+
+            # Brand affinity (prefer profile brands but don't require)
+            if brand_vibe:
+                brand_clause = " OR ".join(["brand LIKE ?" for _ in brand_vibe])
+                query += f" AND ({brand_clause} OR 1=1)"
+                params.extend([f"%{b}%" for b in brand_vibe])
+
+            query += " ORDER BY RANDOM() LIMIT 5"
+
+            try:
+                cursor = conn.execute(query, params)
+                rows = cursor.fetchall()
+                if rows:
+                    # Pick one (with some randomness per proposal)
+                    row = rows[min(option_idx, len(rows) - 1)]
+                    items.append({
+                        "product_id": row["product_id"],
+                        "brand": row["brand"],
+                        "name": row["name"],
+                        "category": cat,
+                        "price": str(row["price"]) if row["price"] else "",
+                        "color": row["colors"] if row["colors"] else "",
+                    })
+            except Exception:
+                continue
+
+        if len(items) >= 2:  # minimum: top + bottom
+            proposals.append({
+                "option": option_label,
+                "description": f"{concept.capitalize()} look for {profile}",
+                "items": items,
+                "rationale": f"Matches {profile}'s style preferences with {concept} concept",
+            })
+
+    conn.close()
+
+    return json.dumps({
+        "character": profile,
+        "concept": concept,
+        "proposals": proposals,
+    }, indent=2, default=str)
+
+
+@mcp.tool()
+def try_on_product(
+    profile: str,
+    product_id: str = None,
+    product_query: str = None,
+    product_ids: list = None,
+    camera_preset: str = "fashion",
+    output_mode: str = "basic",
+    background: str = None,
+    pose: str = None,
+    concept: str = None,
+    model: str = "flash",
+    image_size: str = "1K",
+) -> str:
+    """Generate character wearing real products from catalog.
+
+    Args:
+        profile: Character profile name.
+        product_id: Single product ID from catalog.db.
+        product_query: Natural language product search.
+        product_ids: List of product IDs for full outfit.
+        camera_preset: Camera preset (default: fashion).
+        output_mode: Output mode (default: basic).
+        background: Custom background description.
+        pose: Pose description.
+        concept: Concept name for design history.
+        model: Generation model (flash or pro).
+        image_size: Image size.
+    """
+    import sqlite3
+
+    # Resolve product input
+    try:
+        input_type, input_value = _resolve_product_input(product_ids, product_id, product_query)
+    except ValueError as e:
+        return json.dumps({"error": str(e)})
+
+    # Load profile
+    pm = _get_profile_manager()
+    try:
+        prof = pm.get(profile)
+    except FileNotFoundError as e:
+        return json.dumps({"error": str(e)})
+
+    # Connect to catalog.db
+    db_path = os.environ.get("PRODUCT_CATALOG_DB")
+    if not db_path or not Path(db_path).exists():
+        return json.dumps({"error": "Product catalog database not found. Set PRODUCT_CATALOG_DB environment variable."})
+
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+
+    # Resolve products
+    products = []
+    reference_product_images = []
+
+    if input_type == "product_ids":
+        for pid in input_value:
+            row = conn.execute("SELECT * FROM products WHERE product_id = ?", (pid,)).fetchone()
+            if row:
+                products.append(dict(row))
+                if row["local_image_path"] and Path(row["local_image_path"]).exists():
+                    reference_product_images.append(row["local_image_path"])
+    elif input_type == "product_id":
+        row = conn.execute("SELECT * FROM products WHERE product_id = ?", (input_value,)).fetchone()
+        if row:
+            products.append(dict(row))
+            if row["local_image_path"] and Path(row["local_image_path"]).exists():
+                reference_product_images.append(row["local_image_path"])
+    elif input_type == "product_query":
+        rows = conn.execute(
+            "SELECT * FROM products WHERE name LIKE ? OR brand LIKE ? LIMIT 1",
+            (f"%{input_value}%", f"%{input_value}%")
+        ).fetchall()
+        for row in rows:
+            products.append(dict(row))
+            if row["local_image_path"] and Path(row["local_image_path"]).exists():
+                reference_product_images.append(row["local_image_path"])
+
+    conn.close()
+
+    if not products:
+        return json.dumps({"error": "No products found matching the selection criteria."})
+
+    # Build outfit description from products
+    outfit_parts = []
+    for p in products:
+        part = f"{p.get('brand', '')} {p.get('name', '')}"
+        if p.get('fit'):
+            part += f", {p['fit']} fit"
+        if p.get('materials'):
+            part += f", {p['materials']}"
+        if p.get('colors'):
+            part += f", in {p['colors']}"
+        outfit_parts.append(part.strip())
+
+    outfit_description = "Wearing " + " with ".join(outfit_parts)
+    if pose:
+        outfit_description += f". {pose}"
+
+    # Build reference images list from profile + product images
+    profile_params = pm.map_to_generation_params(profile)
+    ref_images = list(profile_params.get("reference_images", []) or [])
+    ref_images.extend(reference_product_images)
+
+    # Call design_character internally
+    result = design_character(
+        profile=profile,
+        outfit_description=outfit_description,
+        camera_preset=camera_preset,
+        output_mode=output_mode,
+        background_description=background or "clean studio background, soft lighting",
+        reference_images=ref_images if ref_images else None,
+        concept=concept,
+        model=model,
+        image_size=image_size,
+    )
+
+    # Parse result and add product metadata
+    try:
+        result_data = json.loads(result)
+    except (json.JSONDecodeError, TypeError):
+        result_data = {"raw_result": str(result)}
+
+    # Add product info
+    product_info = []
+    for p in products:
+        product_info.append({
+            "product_id": p.get("product_id", ""),
+            "brand": p.get("brand", ""),
+            "name": p.get("name", ""),
+            "price": str(p.get("price", "")),
+            "url": p.get("url", ""),
+        })
+
+    result_data["products"] = product_info
+    result_data["outfit_description"] = outfit_description
+
+    # Auto-record try_on_product to design history with product_ids
+    try:
+        _db = _get_design_db()
+        _concept_id = None
+        _char_name = result_data.get("character_name", profile)
+        if concept:
+            _concept_id = _db.resolve_concept(concept, _char_name)
+        # Find the first generated image path from the nested result
+        _img_path = ""
+        for _shot_data in (result_data.get("shots") or {}).values():
+            if _shot_data.get("status") == "completed" and _shot_data.get("images"):
+                _img_path = _shot_data["images"][0].get("path", "")
+                if _img_path:
+                    break
+        _pid_list = [p.get("product_id", "") for p in products]
+        if _img_path:
+            _db.record_generation(
+                character_name=_char_name,
+                profile_name=profile,
+                concept_id=_concept_id,
+                tool="try_on_product",
+                style=result_data.get("style"),
+                camera_preset=camera_preset,
+                output_mode=output_mode,
+                prompt=outfit_description,
+                model=model,
+                image_size=image_size,
+                image_path=_img_path,
+                product_ids=json.dumps(_pid_list),
+            )
+    except Exception:
+        pass  # Don't fail generation if DB recording fails
+
+    return json.dumps(result_data, indent=2, default=str)
+
+
+# ---------------------------------------------------------------------------
+# Design DB MCP Tools — Concept & History Management
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def create_concept(
+    name: str,
+    character_name: str,
+    description: str = None,
+    tags: list = None,
+) -> str:
+    """Create a themed concept/series for organizing character designs.
+
+    Args:
+        name: Concept name (must be unique per character).
+        character_name: Character this concept belongs to.
+        description: Optional description of the concept.
+        tags: Optional list of tags for categorization.
+    """
+    db = _get_design_db()
+    cid = db.create_concept(name, character_name, description=description, tags=tags)
+    return json.dumps({"status": "created", "concept_id": cid, "name": name})
+
+
+@mcp.tool()
+def list_concepts(
+    character: str = None,
+    status: str = None,
+    limit: int = 50,
+) -> str:
+    """List design concepts/series with optional filters.
+
+    Args:
+        character: Filter by character name.
+        status: Filter by status (e.g., "active", "completed").
+        limit: Maximum number of concepts to return (default 50).
+    """
+    db = _get_design_db()
+    concepts = db.list_concepts(character=character, status=status, limit=limit)
+    return json.dumps({"concepts": concepts, "count": len(concepts)}, indent=2, default=str)
+
+
+@mcp.tool()
+def search_generations(
+    character: str = None,
+    concept: str = None,
+    style: str = None,
+    rating_min: int = None,
+    date_from: str = None,
+    date_to: str = None,
+    favorite_only: bool = False,
+    limit: int = 100,
+) -> str:
+    """Search design generation history with filters.
+
+    Args:
+        character: Filter by character name.
+        concept: Filter by concept name.
+        style: Filter by art style.
+        rating_min: Minimum rating (1-5).
+        date_from: Start date (ISO format, e.g., "2026-01-01").
+        date_to: End date (ISO format).
+        favorite_only: Only return favorited generations.
+        limit: Maximum results (default 100).
+    """
+    db = _get_design_db()
+    results = db.search_generations(
+        character=character, concept=concept, style=style,
+        rating_min=rating_min, date_from=date_from, date_to=date_to,
+        favorite_only=favorite_only, limit=limit,
+    )
+    return json.dumps({"generations": results, "count": len(results)}, indent=2, default=str)
+
+
+@mcp.tool()
+def rate_generation(
+    generation_id: int,
+    rating: int = None,
+    favorite: bool = None,
+    tags: list = None,
+    notes: str = None,
+) -> str:
+    """Rate, favorite, or annotate a generated image.
+
+    Args:
+        generation_id: ID of the generation record.
+        rating: Rating score (1-5).
+        favorite: Mark as favorite.
+        tags: List of tags to apply.
+        notes: Free-text notes.
+    """
+    db = _get_design_db()
+    db.rate_generation(generation_id, rating=rating, favorite=favorite, tags=tags, notes=notes)
+    return json.dumps({"status": "updated", "generation_id": generation_id})
 
 
 if __name__ == "__main__":
