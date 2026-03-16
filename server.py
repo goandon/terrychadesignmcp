@@ -29,6 +29,22 @@ from google import genai
 from google.genai import types
 from PIL import Image, ImageDraw, ImageFont
 
+from presets import (
+    resolve_preset, PHOTOREALISTIC_STYLES, ANIMATION_STYLES,
+    PHOTO_PRESETS, ANIMATION_PRESETS,
+)
+from prompts import build_prompt
+from profile_manager import ProfileManager
+
+_UNSET = object()  # Sentinel for distinguishing "not provided" from None
+
+_profile_manager = None
+def _get_profile_manager() -> ProfileManager:
+    global _profile_manager
+    if _profile_manager is None:
+        _profile_manager = ProfileManager()
+    return _profile_manager
+
 # ---------------------------------------------------------------------------
 # Configuration (reused from terrymcpnanobanana)
 # ---------------------------------------------------------------------------
@@ -2064,9 +2080,9 @@ mcp = FastMCP("terrycha-design")
 @mcp.tool()
 def design_character(
     character_name: str,
-    character_description: str,
-    style: str,
-    outfit_description: str,
+    character_description: str = None,
+    style: str = None,
+    outfit_description: str = None,
     hair_description: Optional[str] = None,
     accessories: Optional[str] = None,
     makeup_description: Optional[str] = None,
@@ -2092,6 +2108,10 @@ def design_character(
     composite_sheet: bool = True,
     max_retries: int = DEFAULT_MAX_RETRIES,
     on_block: str = DEFAULT_ON_BLOCK,
+    profile: Optional[str] = None,
+    camera_preset: Optional[str] = None,
+    camera_override: Optional[dict] = None,
+    concept: Optional[str] = None,
 ) -> str:
     """Generate a consistent character reference sheet with composite image.
 
@@ -2153,10 +2173,66 @@ def design_character(
         on_block: Behavior when safety filter blocks. "retry" = auto-retry
                   with softened prompt, "stop" = fail immediately. Default: "retry".
 
+        profile: Character profile name to load (e.g. "siwol", "claudie").
+                 Provides defaults for appearance, style, and generation params.
+                 Explicitly provided parameters always override profile values.
+        camera_preset: Camera/style preset name (e.g. "portrait", "fashion", "street").
+        camera_override: Dict to override specific preset keys (camera, lens, lighting).
+        concept: Optional concept name for design history tracking.
+
     Returns:
         JSON with character_name, output_dir, per-shot results, composite
         sheet path, summary counts, and generation settings.
     """
+    # --- Profile loading ---
+    # When a profile is specified, load its defaults for any parameter not
+    # explicitly provided by the caller. This is additive: when no profile
+    # is given, behavior is identical to before.
+    if profile is not None:
+        try:
+            pm = _get_profile_manager()
+            profile_params = pm.map_to_generation_params(profile)
+        except FileNotFoundError as e:
+            return json.dumps({"error": str(e)})
+
+        # Apply profile defaults for parameters that were not explicitly provided
+        if character_description is None:
+            character_description = profile_params.get("character_description", "")
+        if hair_description is None:
+            hair_description = profile_params.get("hair_description")
+        if expression is None:
+            expression = profile_params.get("expression")
+        if style is None:
+            style = profile_params.get("style")
+        if camera_preset is None:
+            camera_preset = profile_params.get("camera_preset")
+        if output_mode == "full_sheet":  # only override if caller used default
+            profile_output_mode = profile_params.get("output_mode")
+            if profile_output_mode is not None:
+                output_mode = profile_output_mode
+        if reference_images is None:
+            reference_images = profile_params.get("reference_images")
+
+    # Ensure required parameters have values after profile loading
+    if not character_description:
+        return json.dumps({"error": "character_description is required (provide directly or via profile)"})
+    if not style:
+        return json.dumps({"error": "style is required (provide directly or via profile)"})
+    if not outfit_description:
+        outfit_description = ""  # Allow empty outfit when using profile
+
+    # --- Resolve camera preset ---
+    resolved_preset = None
+    if camera_preset is not None or camera_override is not None:
+        try:
+            resolved_preset = resolve_preset(camera_preset, style, override=camera_override)
+        except ValueError as e:
+            return json.dumps({"error": str(e)})
+    elif style in PHOTOREALISTIC_STYLES:
+        resolved_preset = resolve_preset(None, style)  # auto-detect default
+    elif style in ANIMATION_STYLES:
+        resolved_preset = resolve_preset(None, style)
+
     # Validate retry parameters
     if on_block not in VALID_ON_BLOCK:
         return json.dumps({"error": f"Invalid on_block: {on_block}. Valid: {sorted(VALID_ON_BLOCK)}"})
@@ -2259,21 +2335,65 @@ def design_character(
         is_anchor = shot_def.get("is_anchor", False) and anchor_image_path is None
 
         # Build the shot prompt
-        shot_prompt = _build_character_prompt(
-            shot_type=shot_type,
-            character_description=character_description,
-            outfit_description=outfit_description,
-            style=style,
-            hair_description=hair_description,
-            accessories=accessories,
-            makeup_description=makeup_description,
-            distinguishing_features=distinguishing_features,
-            expression=expression,
-            age_range=age_range,
-            body_type=body_type,
-            background_description=background_description,
-            color_palette=color_palette,
-        )
+        # Use build_prompt() from prompts.py when a camera/style preset is
+        # resolved (photorealistic or animation styles).  Fall back to the
+        # legacy _build_character_prompt() for other styles so that existing
+        # behaviour is preserved.
+        if resolved_preset is not None or style in PHOTOREALISTIC_STYLES or style in ANIMATION_STYLES:
+            # Assemble a character description block (same logic as
+            # _build_character_prompt) so build_prompt() gets a rich string.
+            _char_parts = []
+            if age_range:
+                _char_parts.append(age_range)
+            _char_parts.append(character_description)
+            if body_type:
+                _char_parts.append(f"{body_type} body type")
+            if hair_description:
+                _char_parts.append(f"Hair: {hair_description}")
+            if makeup_description:
+                _char_parts.append(f"Makeup: {makeup_description}")
+            if accessories:
+                _char_parts.append(f"Wearing accessories: {accessories}")
+            if distinguishing_features:
+                _char_parts.append(distinguishing_features)
+            _char_block = ". ".join(_char_parts)
+
+            # Determine ethereal flag from profile
+            _is_ethereal = False
+            if profile is not None:
+                try:
+                    _prof = _get_profile_manager().get(profile)
+                    _is_ethereal = (_prof.get("appearance") or {}).get("ethereal", False)
+                except FileNotFoundError:
+                    pass
+
+            shot_prompt = build_prompt(
+                shot_type=shot_type,
+                style=style,
+                character=_char_block,
+                outfit=outfit_description,
+                expression=expression or "neutral, calm",
+                background=background_description or "clean white studio background",
+                color_palette=color_palette,
+                preset=resolved_preset,
+                ethereal=_is_ethereal,
+            )
+        else:
+            shot_prompt = _build_character_prompt(
+                shot_type=shot_type,
+                character_description=character_description,
+                outfit_description=outfit_description,
+                style=style,
+                hair_description=hair_description,
+                accessories=accessories,
+                makeup_description=makeup_description,
+                distinguishing_features=distinguishing_features,
+                expression=expression,
+                age_range=age_range,
+                body_type=body_type,
+                background_description=background_description,
+                color_palette=color_palette,
+            )
 
         # Build config with shot-specific aspect ratio
         shot_config = _build_config(
@@ -3498,6 +3618,16 @@ def get_design_options() -> str:
             "pricing_usd_per_image": GENERATION_PRICING_USD,
             "note": "Approximate costs. Use estimate_generation_cost tool for detailed breakdown.",
         },
+        "camera_presets": {
+            "photorealistic": sorted(PHOTO_PRESETS.keys()),
+            "animation": sorted(ANIMATION_PRESETS.keys()),
+            "note": "Use camera_preset param in design_character or pass camera_override dict",
+        },
+        "profiles": {
+            "description": "Character profiles for IP management (create/get/update/delete/list_character_profiles)",
+            "available": [p["name"] for p in _get_profile_manager().list_profiles()],
+            "note": "Pass profile='name' to design_character to auto-fill appearance/style defaults",
+        },
         "recommended_settings": {
             "temperature": "0.5-0.8 for consistent character sheets",
             "seed": "Use a fixed seed for maximum reproducibility",
@@ -3518,6 +3648,115 @@ def get_design_options() -> str:
     }
 
     return json.dumps(options, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+def create_character_profile(
+    name: str,
+    appearance: dict,
+    personality: dict = None,
+    style_preferences: dict = None,
+    background: dict = None,
+    branding: dict = None,
+    generation_defaults: dict = None,
+) -> str:
+    """Create a new character profile for IP management.
+
+    Profiles store appearance, personality, style preferences, and generation
+    defaults.  Once created, pass the profile name to design_character() to
+    auto-fill character parameters.
+
+    Args:
+        name: Character name (case-insensitive, used as filename).
+        appearance: Dict with appearance fields (age_range, ethnicity, body_type,
+                    skin, face, eyes, hair, distinguishing, ethereal).
+        personality: Optional personality dict (mbti, keywords, expression).
+        style_preferences: Optional style preferences dict.
+        background: Optional background/backstory dict.
+        branding: Optional branding dict (catchphrase, signature_poses).
+        generation_defaults: Optional generation defaults dict
+                             (style, camera_preset, output_mode, reference_images).
+
+    Returns:
+        JSON with status, path, and name.
+    """
+    pm = _get_profile_manager()
+    profile_data = {"name": name, "version": 1, "appearance": appearance}
+    if personality:
+        profile_data["personality"] = personality
+    if style_preferences:
+        profile_data["style_preferences"] = style_preferences
+    if background:
+        profile_data["background"] = background
+    if branding:
+        profile_data["branding"] = branding
+    if generation_defaults:
+        profile_data["generation_defaults"] = generation_defaults
+    path = pm.create(profile_data)
+    return json.dumps({"status": "created", "path": str(path), "name": name})
+
+
+@mcp.tool()
+def get_character_profile(name: str) -> str:
+    """Get a character profile by name.
+
+    Args:
+        name: Character name (case-insensitive).
+
+    Returns:
+        JSON with full profile data.
+    """
+    pm = _get_profile_manager()
+    prof = pm.get(name)
+    return json.dumps(prof, indent=2, default=str)
+
+
+@mcp.tool()
+def update_character_profile(name: str, updates: dict) -> str:
+    """Update character profile fields using dot-notation paths.
+
+    Args:
+        name: Character name (case-insensitive).
+        updates: Dict of dot-notation paths to new values,
+                 e.g. {"appearance.eyes": "blue", "generation_defaults.style": "anime"}.
+
+    Returns:
+        JSON with status, version, and name.
+    """
+    pm = _get_profile_manager()
+    updated = pm.update(name, updates)
+    return json.dumps({"status": "updated", "version": updated["version"], "name": name})
+
+
+@mcp.tool()
+def delete_character_profile(name: str, confirm: bool = False) -> str:
+    """Delete a character profile.  Set confirm=True to proceed.
+
+    Args:
+        name: Character name (case-insensitive).
+        confirm: Must be True to perform deletion.
+
+    Returns:
+        JSON with status and name.
+    """
+    pm = _get_profile_manager()
+    pm.delete(name, confirm=confirm)
+    return json.dumps({"status": "deleted", "name": name})
+
+
+@mcp.tool()
+def list_character_profiles(limit: int = 50) -> str:
+    """List all available character profiles.
+
+    Args:
+        limit: Maximum number of profiles to return (default 50).
+
+    Returns:
+        JSON with profiles list and count.
+    """
+    pm = _get_profile_manager()
+    profiles = pm.list_profiles(limit=limit)
+    return json.dumps({"profiles": profiles, "count": len(profiles)}, indent=2)
 
 
 if __name__ == "__main__":
