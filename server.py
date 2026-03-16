@@ -347,6 +347,21 @@ DEFAULT_SHOTS = [
     "face_right",
 ]
 
+# Output mode presets — shortcuts for common shot configurations
+OUTPUT_MODE_SHOTS = {
+    "basic": ["face_front", "face_left", "full_body_front"],
+    "face_angles": ["face_front", "face_left", "face_right"],
+    "full_sheet": [
+        "face_front",
+        "face_left",
+        "face_right",
+        "full_body_front",
+        "full_body_left",
+        "full_body_back",
+    ],
+}
+VALID_OUTPUT_MODES = set(OUTPUT_MODE_SHOTS.keys())
+
 # ---------------------------------------------------------------------------
 # Pose Sample Sheet Constants
 # ---------------------------------------------------------------------------
@@ -1631,6 +1646,93 @@ def _create_composite_sheet(
 
 
 # ---------------------------------------------------------------------------
+# Composite Row Builder (basic / face_angles modes)
+# ---------------------------------------------------------------------------
+
+def _create_composite_row(
+    shot_images: dict[str, str],
+    shot_order: list[str],
+    character_name: str,
+    mode: str,
+    output_dir: Path,
+) -> Optional[str]:
+    """Create a horizontal row composite from a small set of shot images.
+
+    Used for output_mode='basic' and output_mode='face_angles'.
+    Layout: images arranged side-by-side with 8px gap, scaled to uniform height.
+    Header "{character_name} — {mode}" above, Korean labels below each image.
+    """
+    # Load available images in shot_order
+    loaded = []
+    for shot_type in shot_order:
+        path = shot_images.get(shot_type)
+        if path and Path(path).exists():
+            loaded.append((shot_type, Image.open(path)))
+
+    if not loaded:
+        return None
+
+    gap = 8
+    border = 20
+    header_h = 44
+    label_h = 28
+
+    # Determine target height: tallest image height
+    target_h = max(img.height for _, img in loaded)
+
+    # Scale all images to target_h (proportional)
+    scaled = []
+    for shot_type, img in loaded:
+        scale = target_h / img.height
+        new_w = int(img.width * scale)
+        scaled.append((shot_type, img.resize((new_w, target_h), Image.LANCZOS)))
+
+    # Canvas dimensions
+    total_w = sum(img.width for _, img in scaled) + gap * max(len(scaled) - 1, 0)
+    canvas_w = border * 2 + total_w
+    canvas_h = border * 2 + header_h + target_h + label_h
+
+    canvas = Image.new("RGB", (canvas_w, canvas_h), COMPOSITE_BG_COLOR)
+    draw = ImageDraw.Draw(canvas)
+
+    # Load fonts
+    font_header, font_label = _load_fonts(28, 14)
+
+    # Draw header
+    header_text = f"{character_name} \u2014 {mode}"
+    draw.text(
+        (border, border + (header_h - 32) // 2),
+        header_text,
+        fill=COMPOSITE_TEXT_COLOR,
+        font=font_header,
+    )
+
+    y_top = border + header_h
+
+    # Draw images and labels
+    x = border
+    for shot_type, img in scaled:
+        canvas.paste(img, (x, y_top))
+        label = SHOT_DEFINITIONS[shot_type]["label_ko"]
+        bbox = draw.textbbox((0, 0), label, font=font_label)
+        text_w = bbox[2] - bbox[0]
+        draw.text(
+            (x + (img.width - text_w) // 2, y_top + target_h + 6),
+            label,
+            fill=COMPOSITE_LABEL_COLOR,
+            font=font_label,
+        )
+        x += img.width + gap
+
+    # Save composite
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    composite_path = output_dir / f"composite_row_{mode}_{timestamp}.jpg"
+    canvas.save(composite_path, "JPEG", quality=95)
+
+    return str(composite_path)
+
+
+# ---------------------------------------------------------------------------
 # Pose Grid Sheet Builder
 # ---------------------------------------------------------------------------
 
@@ -1985,6 +2087,7 @@ def design_character(
     thinking_level: Optional[str] = None,
     output_format: str = "file",
     shots: Optional[list[str]] = None,
+    output_mode: str = "full_sheet",
     both_sides: bool = False,
     composite_sheet: bool = True,
     max_retries: int = DEFAULT_MAX_RETRIES,
@@ -2034,7 +2137,13 @@ def design_character(
         shots: Optional list of specific shot types to generate.
                Valid: "full_body_front", "full_body_left", "full_body_right",
                "full_body_back", "face_left", "face_front", "face_right",
-               "upper_body". Default: 6 shots (no upper_body/full_body_right).
+               "upper_body". If provided, overrides output_mode.
+        output_mode: Preset shot selection. Valid: "full_sheet" (default,
+                     6 shots), "basic" (3 shots: face_front, face_left,
+                     full_body_front), "face_angles" (3 shots: face_front,
+                     face_left, face_right). Ignored when shots is provided.
+                     Composite layout: full_sheet → composite_sheet,
+                     basic/face_angles → composite_row.
         both_sides: Add full_body_right to default shots for asymmetric
                     accessory/feature coverage. Default: False.
         composite_sheet: Auto-generate composite reference sheet image.
@@ -2052,6 +2161,12 @@ def design_character(
     if on_block not in VALID_ON_BLOCK:
         return json.dumps({"error": f"Invalid on_block: {on_block}. Valid: {sorted(VALID_ON_BLOCK)}"})
 
+    # Validate output_mode
+    if output_mode not in VALID_OUTPUT_MODES:
+        return json.dumps({
+            "error": f"Invalid output_mode: '{output_mode}'. Valid: {sorted(VALID_OUTPUT_MODES)}"
+        })
+
     # Resolve model
     try:
         model_id = _resolve_model(model)
@@ -2059,7 +2174,11 @@ def design_character(
         return json.dumps({"error": str(e)})
 
     # Determine which shots to generate
-    selected_shots = list(shots) if shots else list(DEFAULT_SHOTS)
+    # shots parameter overrides output_mode when explicitly provided
+    if shots is not None:
+        selected_shots = list(shots)
+    else:
+        selected_shots = list(OUTPUT_MODE_SHOTS[output_mode])
     if both_sides and "full_body_right" not in selected_shots:
         # Insert after full_body_left for natural ordering
         try:
@@ -2280,12 +2399,25 @@ def design_character(
                 if first_img.get("path"):
                     shot_image_map[shot_type] = first_img["path"]
 
-        composite_path = _create_composite_sheet(
-            shot_images=shot_image_map,
-            character_name=character_name,
-            style=style,
-            output_dir=char_dir,
-        )
+        # Choose composite layout based on output_mode
+        # full_sheet (or custom shots) → full composite sheet
+        # basic / face_angles → simpler horizontal row
+        effective_mode = output_mode if shots is None else "full_sheet"
+        if effective_mode == "full_sheet":
+            composite_path = _create_composite_sheet(
+                shot_images=shot_image_map,
+                character_name=character_name,
+                style=style,
+                output_dir=char_dir,
+            )
+        else:
+            composite_path = _create_composite_row(
+                shot_images=shot_image_map,
+                shot_order=selected_shots,
+                character_name=character_name,
+                mode=effective_mode,
+                output_dir=char_dir,
+            )
         if composite_path:
             final_result["composite_sheet"] = composite_path
 
@@ -2989,6 +3121,7 @@ def estimate_generation_cost(
     model: str = DEFAULT_MODEL,
     image_size: str = "1K",
     shots: Optional[list[str]] = None,
+    output_mode: str = "full_sheet",
     both_sides: bool = False,
     categories: Optional[list[str]] = None,
     poses: Optional[list[str]] = None,
@@ -3007,7 +3140,9 @@ def estimate_generation_cost(
               "add_character_pose", "generate_pose_sheet", "generate_chat_emoji".
         model: "flash" or "pro". Default: "flash".
         image_size: Target image size. Default: "1K".
-        shots: (design_character) Custom shot list. Default: 6 shots.
+        shots: (design_character) Custom shot list. Overrides output_mode.
+        output_mode: (design_character) Preset: "full_sheet" (6), "basic" (3),
+                     "face_angles" (3). Default: "full_sheet".
         both_sides: (design_character) Include full_body_right. Default: False.
         categories: (generate_pose_sheet) Pose categories.
         poses: (generate_pose_sheet) Individual pose keys.
@@ -3044,8 +3179,17 @@ def estimate_generation_cost(
             image_count = len(shots)
             breakdown["custom_shots"] = shots
         else:
-            image_count = 7 if both_sides else 6
-            breakdown["default_shots"] = 7 if both_sides else 6
+            # Validate output_mode
+            if output_mode not in VALID_OUTPUT_MODES:
+                return json.dumps({
+                    "error": f"Invalid output_mode: '{output_mode}'. Valid: {sorted(VALID_OUTPUT_MODES)}"
+                })
+            base_shots = list(OUTPUT_MODE_SHOTS[output_mode])
+            if both_sides and "full_body_right" not in base_shots:
+                base_shots.append("full_body_right")
+            image_count = len(base_shots)
+            breakdown["output_mode"] = output_mode
+            breakdown["shots"] = base_shots
             breakdown["both_sides"] = both_sides
 
     elif tool == "add_character_pose":
@@ -3244,9 +3388,18 @@ def get_design_options() -> str:
                 SHOT_DEFINITIONS.items(), key=lambda x: x[1]["order"]
             )
         },
+        "output_modes": {
+            key: {
+                "shots": shots,
+                "shot_count": len(shots),
+                "composite_layout": "composite_sheet" if key == "full_sheet" else "composite_row",
+            }
+            for key, shots in OUTPUT_MODE_SHOTS.items()
+        },
         "features": {
             "composite_sheet": "Auto-generates a single composite reference image",
             "both_sides": "Adds full_body_right for asymmetric accessory coverage (default: off)",
+            "output_mode": "Preset shot selection: 'full_sheet' (6 shots), 'basic' (3 shots), 'face_angles' (3 shots)",
         },
         "models": {
             "flash": {
