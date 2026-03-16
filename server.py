@@ -4102,7 +4102,12 @@ def try_on_product(
 
     # Call design_character internally (access underlying fn from FunctionTool)
     _design_fn = design_character.fn if hasattr(design_character, "fn") else design_character
+    # Generate character_name from profile + product info
+    product_label = products[0].get("brand", "product").replace(" ", "_").lower()
+    char_name = f"{profile}_tryon_{product_label}"
+
     result = _design_fn(
+        character_name=char_name,
         profile=profile,
         outfit_description=outfit_description,
         camera_preset=camera_preset,
