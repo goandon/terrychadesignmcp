@@ -3906,13 +3906,21 @@ def suggest_outfits(
     theme_colors = style_prefs.get("theme_colors", [])
     brand_vibe = style_prefs.get("brand_vibe", [])
 
-    # Connect to catalog.db
+    # Connect to catalog.db (env var > platform default)
     db_path = os.environ.get("PRODUCT_CATALOG_DB")
     if not db_path:
-        return json.dumps({"error": "Product catalog database not found. Set PRODUCT_CATALOG_DB environment variable."})
-
-    if not Path(db_path).exists():
-        return json.dumps({"error": f"Product catalog database not found at {db_path}. Set PRODUCT_CATALOG_DB environment variable."})
+        # Auto-detect platform default
+        _catalog_defaults = [
+            _NAS_PATH_MAP["macos"] + "Claudie/product_catalog/catalog.db",
+            _NAS_PATH_MAP["windows"] + "Claudie/product_catalog/catalog.db",
+            _NAS_PATH_MAP["unc"] + "Claudie/product_catalog/catalog.db",
+        ]
+        for candidate in _catalog_defaults:
+            if Path(candidate).exists():
+                db_path = candidate
+                break
+    if not db_path or not Path(db_path).exists():
+        return json.dumps({"error": f"Product catalog database not found. Set PRODUCT_CATALOG_DB environment variable. Searched: {_catalog_defaults if not db_path else db_path}"})
 
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
