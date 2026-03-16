@@ -2,8 +2,22 @@
 
 An MCP server that generates consistent character reference image sets using Google's Nano Banana models (Vertex AI). Designed for maintaining visual consistency across video/image production pipelines.
 
+## What's New in v0.4.0
+
+- **Output modes**: `basic` (3-shot) and `face_angles` (3-shot) presets for faster generation
+- **Camera presets**: Photorealistic (portrait, fashion, street, editorial, selfie) and animation (anime_standard, anime_dramatic, chibi, game_art, webtoon) presets
+- **Character profiles**: YAML-based IP management with 5 CRUD tools and built-in Siwol/Claudie profiles
+- **Product try-on**: `suggest_outfits` + `try_on_product` tools for fashion catalog integration
+- **Design history DB**: Auto-recording of all generations with concept/series organization, ratings, search
+- **19 total tools** (up from 8 in v0.3.1)
+
 ## Features
 
+- **Output modes**: Preset shot selections (`full_sheet`, `basic`, `face_angles`) for flexible generation scope
+- **Camera presets**: 10 presets covering photorealistic and animation styles
+- **Character profiles**: YAML-based profiles for IP management and design consistency
+- **Product try-on**: Generate character images wearing real products from a catalog
+- **Design history**: Auto-recording of all generations with search, ratings, and concept grouping
 - **7-angle reference sheet**: Full body (front, left, right, back) + Face close-up (left, front, right)
 - **Composite sheet**: Auto-generates a single combined reference image from all shots
 - **Anchor-based consistency**: First image serves as visual reference for all subsequent shots
@@ -27,7 +41,7 @@ pip install -r requirements.txt
 
 - Python 3.10+
 - Google Cloud project with Vertex AI enabled (or Gemini API key)
-- `fastmcp>=2.0.0`, `google-genai>=1.0.0`, `Pillow>=10.0.0`
+- `fastmcp>=2.0.0`, `google-genai>=1.0.0`, `Pillow>=10.0.0`, `PyYAML>=6.0`
 
 ## Configuration
 
@@ -43,7 +57,10 @@ pip install -r requirements.txt
         "GOOGLE_CLOUD_PROJECT": "your-project-id",
         "GOOGLE_CLOUD_LOCATION": "global",
         "GOOGLE_GENAI_USE_VERTEXAI": "true",
-        "TERRYCHA_DESIGN_OUTPUT_DIR": "/path/to/output"
+        "TERRYCHA_DESIGN_OUTPUT_DIR": "/path/to/output",
+        "TERRYCHA_DESIGN_PROFILES_DIR": "/path/to/profiles",
+        "TERRYCHA_DESIGN_DB": "/path/to/design_history.db",
+        "PRODUCT_CATALOG_DB": "/path/to/catalog.db"
       }
     }
   }
@@ -71,7 +88,7 @@ pip install -r requirements.txt
 
 Set `GOOGLE_GENAI_USE_VERTEXAI=false` and provide `GEMINI_API_KEY` instead.
 
-## Tools
+## Tools (19 total)
 
 ### `design_character`
 
@@ -106,11 +123,16 @@ Generate a complete character reference sheet (6 shots default, 7 with `both_sid
 | `image_size` | "1K" | "512px", "1K", "2K", "4K" |
 | `temperature` | None | 0.0-2.0 (recommend 0.5-0.8) |
 | `seed` | None | Fixed seed for reproducibility |
-| `shots` | 6 default | List of specific shot types |
+| `output_mode` | "full_sheet" | Shot preset: "full_sheet", "basic", "face_angles" |
+| `shots` | None | List of specific shot types (overrides output_mode) |
 | `both_sides` | False | Add full_body_right for asymmetric features |
 | `composite_sheet` | True | Auto-generate composite reference image |
 | `max_retries` | 3 | Max retry attempts on safety filter block (0=no retry) |
 | `on_block` | "retry" | Safety block behavior: "retry" (auto-retry) or "stop" (fail immediately) |
+| `profile` | None | Character profile name to load (e.g. "siwol", "claudie") |
+| `camera_preset` | None | Camera/style preset (e.g. "portrait", "fashion", "anime_standard") |
+| `camera_override` | None | Dict to override specific preset keys (camera, lens, lighting) |
+| `concept` | None | Concept name for design history tracking |
 
 **Example:**
 ```
@@ -129,6 +151,16 @@ design_character(
     temperature=0.6,
     seed=42,
     image_size="2K"
+)
+```
+
+**Profile-driven generation:**
+```
+design_character(
+    character_name="Siwol",
+    profile="siwol",
+    outfit_description="White oversized hoodie and denim shorts",
+    concept="casual_spring"
 )
 ```
 
@@ -308,11 +340,222 @@ List generated character reference sheets with image counts.
 
 ### `get_design_options`
 
-Get all supported styles, shot types, model parameters, pose categories, emoji expression sets, platform specs, and recommended settings.
+Get all supported styles, shot types, output modes, camera presets, model parameters, pose categories, emoji expression sets, platform specs, and recommended settings.
+
+---
+
+## Output Modes
+
+The `output_mode` parameter in `design_character` selects a preset shot group:
+
+| Mode | Shots | Description |
+|------|-------|-------------|
+| `full_sheet` | 6 | Default. face_front + face_left + face_right + full_body_front + full_body_left + full_body_back. Produces full composite sheet. |
+| `basic` | 3 | face_front + face_left + full_body_front. Faster/cheaper for quick drafts. Produces composite row. |
+| `face_angles` | 3 | face_front + face_left + face_right. Face-only coverage. Produces composite row. |
+
+When `shots` is explicitly provided, it overrides `output_mode`.
+
+**Example (quick draft):**
+```
+design_character(
+    character_name="Luna",
+    ...,
+    output_mode="basic",
+    image_size="1K"
+)
+```
+
+---
+
+## Camera Presets
+
+Use the `camera_preset` parameter in `design_character` to apply a photographic or animation-style camera configuration. Use `camera_override` to adjust individual keys.
+
+### Photorealistic Presets
+
+| Preset | Style |
+|--------|-------|
+| `portrait` | Classic headshot/beauty portrait lighting |
+| `fashion` | Editorial fashion photography |
+| `street` | Natural light street photography |
+| `editorial` | Magazine editorial style |
+| `selfie` | Casual smartphone self-portrait |
+
+### Animation Presets
+
+| Preset | Style |
+|--------|-------|
+| `anime_standard` | Standard anime visual style |
+| `anime_dramatic` | High-contrast dramatic anime framing |
+| `chibi` | Super-deformed chibi style |
+| `game_art` | RPG/game portrait style |
+| `webtoon` | Korean webtoon visual style |
+
+**Example:**
+```
+design_character(
+    character_name="Luna",
+    ...,
+    camera_preset="fashion",
+    camera_override={"lighting": "golden hour backlight"}
+)
+```
+
+Call `get_design_options()` to see the full preset configuration for each key.
+
+---
+
+## Character Profiles
+
+Profiles store complete character definitions in YAML files. Once created, pass the profile name to `design_character(profile="name")` to auto-fill appearance, style, and generation defaults. Explicit parameters always override profile values.
+
+### Profile CRUD Tools
+
+| Tool | Description |
+|------|-------------|
+| `create_character_profile` | Create a new YAML profile |
+| `get_character_profile` | Load and display a profile by name |
+| `update_character_profile` | Patch specific fields in an existing profile |
+| `delete_character_profile` | Remove a profile (requires `confirm=True`) |
+| `list_character_profiles` | List all available profiles |
+
+### Built-in Profiles
+
+| Profile | Description |
+|---------|-------------|
+| `siwol` | Black wavy hair, blue eyes, beauty mark, semi-realistic anime style |
+| `claudie` | Blonde ponytail, blue eyes, freckles, semi-realistic anime style |
+
+### Profile YAML Structure
+
+```yaml
+name: luna
+appearance:
+  character_description: "Young East Asian woman, fair skin, almond-shaped brown eyes"
+  hair_description: "Long straight black hair, blunt bangs"
+  distinguishing_features: "Small beauty mark under left eye"
+style_preferences:
+  default_style: "anime"
+  camera_preset: "anime_standard"
+generation_defaults:
+  temperature: 0.6
+  seed: 42
+  image_size: "2K"
+  output_mode: "full_sheet"
+```
+
+### Profile-based generation
+
+```
+# Auto-fill all appearance/style defaults from profile
+design_character(
+    character_name="Siwol",
+    profile="siwol",
+    outfit_description="White tank top and denim mini skirt",
+    concept="summer_casual"
+)
+```
+
+Profiles directory defaults to `profiles/` inside the output directory. Override with `TERRYCHA_DESIGN_PROFILES_DIR`.
+
+---
+
+## Product Try-On
+
+Requires a product catalog SQLite database (set via `PRODUCT_CATALOG_DB` env var, compatible with the Atelier fashion commerce pipeline).
+
+### `suggest_outfits`
+
+Propose 3 outfit combinations from the catalog based on style direction and character profile.
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `style_direction` | str | Styling direction (e.g. "casual summer", "office chic") |
+| `character_name` | str | Character name for context |
+| `profile` | str | Character profile to match styling to |
+| `product_ids` | list | Pre-select specific product IDs |
+| `product_query` | str | Free-text search across catalog |
+
+**Example:**
+```
+suggest_outfits(
+    style_direction="casual summer street style",
+    character_name="Siwol",
+    profile="siwol"
+)
+# Returns: 3 outfit proposals with product IDs, names, and descriptions
+```
+
+### `try_on_product`
+
+Generate a character image wearing a specific product from the catalog using reference images.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `character_name` | str | Yes | Character name |
+| `reference_images` | list | Yes | Character reference images |
+| `product_id` | str | Yes* | Product ID from catalog |
+| `product_ids` | list | No | Multiple products for an outfit |
+| `product_query` | str | No | Text search to auto-select product |
+| `style` | str | No | Override art style |
+| `camera_preset` | str | No | Camera/style preset |
+| `concept` | str | No | Concept name for history tracking |
+
+*At least one of `product_id`, `product_ids`, or `product_query` is required.
+
+**Example:**
+```
+try_on_product(
+    character_name="Siwol",
+    reference_images=["/path/to/Siwol_20260316/face_front_....jpg"],
+    product_id="MUS-12345",
+    camera_preset="street"
+)
+```
+
+---
+
+## Design History DB
+
+All generations are automatically recorded in a SQLite database when `TERRYCHA_DESIGN_DB` is set. Records include character name, prompt snapshot, output paths, model settings, and optional ratings.
+
+### Concepts
+
+Concepts group related generations into named series (e.g. "summer_lookbook", "seasonal_emoji_set").
+
+### History Tools
+
+| Tool | Description |
+|------|-------------|
+| `create_concept` | Create a named concept/series for organizing generations |
+| `list_concepts` | List all concepts with generation counts |
+| `search_generations` | Search history by character, concept, date range, or rating |
+| `rate_generation` | Assign a 1-5 star rating and optional notes to a generation |
+
+**Example workflow:**
+```
+# 1. Create a concept for a campaign
+create_concept(name="spring_2026", description="Spring collection lookbook")
+
+# 2. Generate with concept tracking
+design_character(
+    character_name="Siwol",
+    profile="siwol",
+    outfit_description="Floral sundress",
+    concept="spring_2026"
+)
+
+# 3. Search and rate
+search_generations(character="Siwol", concept="spring_2026")
+rate_generation(generation_id="...", rating=5, notes="Hero shot for campaign")
+```
+
+---
 
 ## Shot Types
 
-### Default Shots (6)
+### Output Mode: `full_sheet` (default, 6 shots)
 
 | Shot | Aspect Ratio | Description |
 |------|-------------|-------------|
@@ -322,6 +565,22 @@ Get all supported styles, shot types, model parameters, pose categories, emoji e
 | `face_left` | 1:1 | Face close-up, left profile |
 | `face_front` | 1:1 | Face close-up, front |
 | `face_right` | 1:1 | Face close-up, right profile |
+
+### Output Mode: `basic` (3 shots)
+
+| Shot | Description |
+|------|-------------|
+| `face_front` | Face close-up, front |
+| `face_left` | Face close-up, left profile |
+| `full_body_front` | Full body front view (anchor) |
+
+### Output Mode: `face_angles` (3 shots)
+
+| Shot | Description |
+|------|-------------|
+| `face_front` | Face close-up, front |
+| `face_left` | Face close-up, left profile |
+| `face_right` | Face close-up, right profile |
 
 ### Optional Shots
 
@@ -347,6 +606,8 @@ A single reference sheet image is auto-generated after all shots complete:
 
 With `both_sides=True`, `full_body_right` is added as a 4th body column.
 
+`basic` and `face_angles` modes produce a horizontal composite row instead.
+
 ## Output Structure
 
 ```
@@ -365,10 +626,14 @@ With `both_sides=True`, `full_body_right` is added as a 4th body column.
 |   +-- ...
 |   +-- pose_sheet_20260302_150030.jpg          <-- grid composite
 +-- Luna_emoji_20260302_160000/                 <-- generate_chat_emoji
-    +-- emoji_happy_20260302_160001_a1b2c3_raw.jpg
-    +-- emoji_happy_20260302_160001_d4e5f6.png  <-- platform-sized
-    +-- ...
-    +-- emoji_preview_sheet_20260302_160100.jpg  <-- preview grid
+|   +-- emoji_happy_20260302_160001_a1b2c3_raw.jpg
+|   +-- emoji_happy_20260302_160001_d4e5f6.png  <-- platform-sized
+|   +-- ...
+|   +-- emoji_preview_sheet_20260302_160100.jpg  <-- preview grid
++-- profiles/                                   <-- character profiles
+|   +-- siwol.yaml
+|   +-- claudie.yaml
++-- design_history.db                           <-- design history DB
 ```
 
 ## Environment Variables
@@ -377,6 +642,9 @@ With `both_sides=True`, `full_body_right` is added as a 4th body column.
 |----------|---------|-------------|
 | `TERRYCHA_DESIGN_OUTPUT_DIR` | `~/terrycha_design_output` | Output directory |
 | `TERRYCHA_DESIGN_DELAY` | `1.0` | Delay between shots (seconds) |
+| `TERRYCHA_DESIGN_PROFILES_DIR` | `<output_dir>/profiles` | Character profiles directory |
+| `TERRYCHA_DESIGN_DB` | (disabled) | Path to design history SQLite database |
+| `PRODUCT_CATALOG_DB` | (disabled) | Path to product catalog SQLite database |
 | `GOOGLE_CLOUD_PROJECT` | | GCP project ID |
 | `GOOGLE_CLOUD_LOCATION` | `global` | GCP region |
 | `GOOGLE_GENAI_USE_VERTEXAI` | `true` | Use Vertex AI auth |
@@ -423,6 +691,10 @@ Use `estimate_generation_cost` to check worst-case costs (all retries used) befo
 11. **Use `estimate_generation_cost`** before large batch operations to budget API costs
 12. **Set `on_block="stop"`** during testing to fail fast instead of wasting retries
 13. **Avoid label-like descriptions** — use "has freckles on nose" instead of "Distinguishing features: freckles" to prevent text overlay
+14. **Use `output_mode="basic"`** for quick drafts before committing to a full 6-shot sheet
+15. **Use character profiles** to avoid repeating appearance descriptions across sessions
+16. **Use `create_concept`** to group related generations into named campaigns or series
+17. **Use `suggest_outfits`** before `try_on_product` to explore catalog options first
 
 ## License
 
