@@ -4100,8 +4100,9 @@ def try_on_product(
     ref_images = list(profile_params.get("reference_images", []) or [])
     ref_images.extend(reference_product_images)
 
-    # Call design_character internally
-    result = design_character(
+    # Call design_character internally (access underlying fn from FunctionTool)
+    _design_fn = design_character.fn if hasattr(design_character, "fn") else design_character
+    result = _design_fn(
         profile=profile,
         outfit_description=outfit_description,
         camera_preset=camera_preset,
