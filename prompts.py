@@ -482,3 +482,48 @@ def build_prompt(
         prompt = prompt + " " + ETHEREAL_MODIFIER + "."
 
     return prompt
+
+
+def build_sheet_prompt(
+    expressions: list[dict],
+    cols: int,
+    style_hint: str = "",
+) -> str:
+    """Build position-specified grid prompt for sheet generation.
+
+    Each expression dict must have 'key' and 'prompt' fields.
+    Returns the complete prompt string.
+    """
+    import math
+    rows = math.ceil(len(expressions) / cols)
+    grid_label = f"{cols}x{rows}"
+
+    lines = [
+        f"IMPORTANT: Create EXACTLY a {grid_label} grid layout ({cols} columns, {rows} rows) "
+        f"of {len(expressions)} SD/chibi emoji stickers of the SAME character.",
+        f"The image must be organized as a STRICT {cols}-column x {rows}-row TABLE/GRID.",
+        f"Each cell must contain exactly ONE complete chibi character, same size.",
+        "Cells must be clearly separated with equal spacing — no overlapping, no merging.",
+        "All characters must be fully visible (not cropped or cut off at edges).",
+        "",
+    ]
+    if style_hint:
+        lines.append(f"Style: {style_hint}")
+        lines.append("")
+
+    lines.append(f"Grid layout ({cols} columns x {rows} rows, left-to-right, top-to-bottom):")
+    idx = 0
+    for r in range(rows):
+        row_items = []
+        for c in range(cols):
+            if idx < len(expressions):
+                row_items.append(f"[{expressions[idx]['key']}]")
+            idx += 1
+        lines.append(f"  Row {r + 1}: {' | '.join(row_items)}")
+
+    lines.append("")
+    lines.append("Expression details for each cell:")
+    for expr in expressions:
+        lines.append(f"- [{expr['key']}]: {expr['prompt']}")
+
+    return "\n".join(lines)

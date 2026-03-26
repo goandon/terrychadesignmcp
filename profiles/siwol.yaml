@@ -55,5 +55,5 @@ generation_defaults:
   camera_preset: street
   output_mode: basic
   reference_images:
-  - /Volumes/NAS_Data/Claudie/google/character_design/references/siwol/face_front.jpg
-  - /Volumes/NAS_Data/Claudie/google/character_design/references/siwol/full_body_front.jpg
+  - /path/to/references/siwol/face_front.jpg
+  - /path/to/references/siwol/full_body_front.jpg

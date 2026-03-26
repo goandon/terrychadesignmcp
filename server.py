@@ -13,32 +13,71 @@ Author: Terry.Kim <goandonh@gmail.com>
 Co-Author: Claudie
 """
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
+import logging
 import os
-import sys
 import json
 import base64
-import uuid
+import math
 import time
 from pathlib import Path
 from datetime import datetime
 from typing import Optional
 
-from fastmcp import FastMCP
-from google import genai
-from google.genai import types
-from PIL import Image, ImageDraw, ImageFont
+logger = logging.getLogger(__name__)
 
+from PIL import Image
+
+from fastmcp import FastMCP
+from google.genai import types
 from presets import (
     resolve_preset, PHOTOREALISTIC_STYLES, ANIMATION_STYLES,
     PHOTO_PRESETS, ANIMATION_PRESETS,
 )
-from prompts import build_prompt
+from prompts import build_prompt, build_sheet_prompt
 from profile_manager import ProfileManager
 from design_db import DesignDB
 
+from image_io import (
+    NAS_PATH_MAP, convert_nas_path, convert_nas_paths,
+    ensure_design_dir, save_image, save_image_png,
+    load_fonts, create_composite_sheet, create_composite_row,
+    create_pose_grid_sheet, remove_chroma_key_background,
+    resize_for_platform, create_emoji_grid_sheet,
+    create_animated_gif, create_animated_webp, split_sheet_by_contour, export_ico,
+    COMPOSITE_BG_COLOR, COMPOSITE_TEXT_COLOR, COMPOSITE_LABEL_COLOR,
+    EMOJI_PLATFORMS, DEFAULT_EMOJI_PLATFORM, EMOJI_CHROMA_BG,
+    MIME_MAP, OUTPUT_MIME_TYPE, OUTPUT_COMPRESSION_QUALITY,
+    POSE_SHEET_IMAGE_SIZE, POSE_SHEET_ASPECT_RATIO,
+)
+from generation import (
+    get_client, resolve_model, validate_params, build_config,
+    generate_with_retry, build_character_prompt, extract_results, generate_special_expressions,
+    qc_emoji, QC_PASS_THRESHOLD, analyze_sheet_layout,
+    DEFAULT_MAX_RETRIES, DEFAULT_ON_BLOCK, VALID_ON_BLOCK,
+)
+from catalog import (
+    resolve_product_input as _resolve_product_input,  # re-export for test_tryon.py backward compat
+    get_catalog_db_path, suggest_outfit_items, fetch_products,
+    CONCEPT_CATEGORIES,
+)
+from mcp_telemetry import report_tool_call
+
 _UNSET = object()  # Sentinel for distinguishing "not provided" from None
+
+
+def _report_telemetry(**kwargs):
+    """Sync wrapper for async telemetry reporting."""
+    try:
+        import asyncio
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            loop.create_task(report_tool_call(**kwargs))
+        else:
+            loop.run_until_complete(report_tool_call(**kwargs))
+    except Exception:
+        pass  # Never block MCP tool
 
 _profile_manager = None
 def _get_profile_manager() -> ProfileManager:
@@ -46,54 +85,6 @@ def _get_profile_manager() -> ProfileManager:
     if _profile_manager is None:
         _profile_manager = ProfileManager()
     return _profile_manager
-
-
-# --- Cross-platform NAS path mapping ---
-# Single source of truth: profiles store macOS paths.
-# On Windows, auto-convert /Volumes/NAS_Data/ <-> X:/ (SMB mount).
-_NAS_PATH_MAP = {
-    "macos": "/Volumes/NAS_Data/",
-    "windows": "X:/",
-    "unc": "//192.168.0.2/Data_Vol1/",
-}
-
-
-def _convert_nas_path(path_str: str) -> str:
-    """Convert NAS path to current platform equivalent."""
-    is_windows = sys.platform == "win32"
-    if is_windows:
-        # macOS -> Windows
-        if path_str.startswith(_NAS_PATH_MAP["macos"]):
-            return path_str.replace(_NAS_PATH_MAP["macos"], _NAS_PATH_MAP["windows"], 1)
-    else:
-        # Windows -> macOS
-        if path_str.startswith(_NAS_PATH_MAP["windows"]):
-            return path_str.replace(_NAS_PATH_MAP["windows"], _NAS_PATH_MAP["macos"], 1)
-        # UNC -> macOS
-        for unc_prefix in (_NAS_PATH_MAP["unc"], _NAS_PATH_MAP["unc"].replace("/", "\\")):
-            if path_str.startswith(unc_prefix):
-                return path_str.replace(unc_prefix, _NAS_PATH_MAP["macos"], 1)
-    return path_str
-
-
-def _convert_nas_paths(paths: list[str]) -> list[str]:
-    """Convert a list of NAS paths to current platform."""
-    return [_convert_nas_path(p) for p in paths]
-
-
-def _resolve_product_input(product_ids=None, product_id=None, product_query=None):
-    """Resolve product input by priority: product_ids > product_id > product_query."""
-    if product_ids is not None:
-        return ("product_ids", product_ids)
-    elif product_id is not None:
-        return ("product_id", product_id)
-    elif product_query is not None:
-        return ("product_query", product_query)
-    else:
-        raise ValueError(
-            "At least one product selection method must be provided: "
-            "product_ids, product_id, or product_query"
-        )
 
 
 _design_db = None
@@ -164,19 +155,6 @@ NO_OVERLAY_INSTRUCTION = (
     "The output must be a clean image with no overlaid graphics or text of any kind."
 )
 
-# ---------------------------------------------------------------------------
-# Safety Filter Retry Configuration
-# ---------------------------------------------------------------------------
-
-DEFAULT_MAX_RETRIES = 3
-DEFAULT_ON_BLOCK = "retry"  # "retry" = auto-retry with softened prompt, "stop" = fail immediately
-VALID_ON_BLOCK = {"retry", "stop"}
-
-SOFTENING_SUFFIXES = [
-    " Ensure the image is appropriate, tasteful, and suitable for professional character design.",
-    " Create a clean, safe, professional artistic rendering. Family-friendly character design reference.",
-    " Professional character design illustration. Clean, appropriate, high-quality artistic reference.",
-]
 
 # ---------------------------------------------------------------------------
 # Generation Cost Estimation (USD per image, approximate)
@@ -196,17 +174,6 @@ GENERATION_PRICING_USD = {
     },
 }
 
-# Image output defaults
-OUTPUT_MIME_TYPE = "image/jpeg"
-OUTPUT_COMPRESSION_QUALITY = 85
-
-MIME_MAP = {
-    ".png": "image/png",
-    ".jpg": "image/jpeg",
-    ".jpeg": "image/jpeg",
-    ".webp": "image/webp",
-    ".gif": "image/gif",
-}
 
 # ---------------------------------------------------------------------------
 # Character Design Constants
@@ -590,15 +557,6 @@ POSE_CATEGORIES = {
 
 DEFAULT_POSE_CATEGORIES = ["daily_life", "emotion"]
 
-# Pose sheet generation defaults
-POSE_SHEET_IMAGE_SIZE = "512px"
-POSE_SHEET_ASPECT_RATIO = "1:1"
-POSE_SHEET_GRID_PADDING = 12
-POSE_SHEET_GRID_BORDER = 20
-POSE_SHEET_HEADER_HEIGHT = 48
-POSE_SHEET_LABEL_HEIGHT = 28
-POSE_SHEET_BG_COLOR = (245, 245, 245)
-
 # Pose prompt template
 POSE_PROMPT_TEMPLATE = (
     "Full body view of {character}. "
@@ -615,65 +573,6 @@ POSE_PROMPT_TEMPLATE = (
 # Chat Emoji / Sticker Constants
 # ---------------------------------------------------------------------------
 
-EMOJI_PLATFORMS = {
-    "telegram": {
-        "label": "Telegram",
-        "label_ko": "텔레그램",
-        "size": (512, 512),
-        "format": "png",
-        "max_size_kb": 512,
-        "notes": "Sticker format, transparent background",
-    },
-    "discord": {
-        "label": "Discord",
-        "label_ko": "디스코드",
-        "size": (128, 128),
-        "format": "png",
-        "max_size_kb": 256,
-        "notes": "Server emoji, transparent background",
-    },
-    "line": {
-        "label": "LINE",
-        "label_ko": "라인",
-        "size": (370, 320),
-        "format": "png",
-        "max_size_kb": 1024,
-        "notes": "Static sticker, transparent background",
-    },
-    "kakaotalk": {
-        "label": "KakaoTalk",
-        "label_ko": "카카오톡",
-        "size": (360, 360),
-        "format": "png",
-        "max_size_kb": 1024,
-        "notes": "Emoticon sticker",
-    },
-    "slack": {
-        "label": "Slack",
-        "label_ko": "슬랙",
-        "size": (128, 128),
-        "format": "png",
-        "max_size_kb": 128,
-        "notes": "Custom emoji, transparent background",
-    },
-    "whatsapp": {
-        "label": "WhatsApp",
-        "label_ko": "왓츠앱",
-        "size": (512, 512),
-        "format": "webp",
-        "max_size_kb": 100,
-        "notes": "WebP sticker pack format",
-    },
-    "universal": {
-        "label": "Universal (512x512 PNG)",
-        "label_ko": "범용",
-        "size": (512, 512),
-        "format": "png",
-        "max_size_kb": None,
-        "notes": "High-quality source, resize for any platform",
-    },
-}
-DEFAULT_EMOJI_PLATFORM = "universal"
 
 EMOJI_EXPRESSION_SETS = {
     "basic_16": {
@@ -818,6 +717,14 @@ CHIBI_STYLE_PREFIX = (
     "small body, simplified hands and feet, cute exaggerated proportions. "
     "Single character centered on frame. "
     "Clean bold outlines, flat vibrant colors, sticker-ready design."
+)
+
+CHIBI_SHEET_STYLE_PREFIX = (
+    "Super-deformed (SD) chibi character emoji sticker GRID SHEET. "
+    "Each character: 2-3 head-to-body ratio, oversized head, large expressive eyes, "
+    "small body, simplified hands and feet, cute exaggerated proportions. "
+    "Clean bold outlines, flat vibrant colors. "
+    "IMPORTANT: Arrange ALL characters in a strict grid table layout, NOT in a single column."
     + NO_OVERLAY_INSTRUCTION
     + " "
 )
@@ -829,17 +736,51 @@ EMOJI_CONSISTENCY_PREFIX = (
     "skin tone, and key outfit elements (simplified for chibi proportions). "
 )
 
-# Chroma key background instruction for transparent emoji output
-EMOJI_CHROMA_BG = "on a solid bright green (#00FF00) chroma key background"
-EMOJI_CHROMA_COLOR = (0, 255, 0)
-EMOJI_CHROMA_TOLERANCE = 60
 
-# Emoji grid layout constants
-EMOJI_GRID_PADDING = 8
-EMOJI_GRID_BORDER = 16
-EMOJI_GRID_HEADER_HEIGHT = 40
-EMOJI_GRID_LABEL_HEIGHT = 24
-EMOJI_GRID_BG_COLOR = (255, 255, 255)
+# ---------------------------------------------------------------------------
+# Sheet-based emoji pipeline helpers
+# ---------------------------------------------------------------------------
+
+SHEET_PROMPT_CHAR_LIMIT = 8000
+
+
+def _parse_expression_sets(expression_set: str) -> dict:
+    """Parse '+'-delimited expression set names into merged expressions dict."""
+    merged = {}
+    segments = expression_set.split("+")
+    for seg in segments:
+        seg = seg.strip()
+        if seg not in EMOJI_EXPRESSION_SETS:
+            raise ValueError(
+                f"Unknown expression set '{seg}'. "
+                f"Valid: {sorted(EMOJI_EXPRESSION_SETS.keys())}"
+            )
+        merged.update(EMOJI_EXPRESSION_SETS[seg]["expressions"])
+    return merged
+
+
+def _merge_expressions(base_exprs, special_exprs, custom_texts):
+    """Merge base + special + custom into ordered list."""
+    merged = []
+    for key, expr in base_exprs.items():
+        merged.append({
+            "key": key,
+            "label": expr.get("label", key),
+            "label_ko": expr.get("label_ko", ""),
+            "prompt": expr["prompt"],
+            "category": "base",
+        })
+    merged.extend(special_exprs)
+    for i, text in enumerate(custom_texts):
+        merged.append({
+            "key": f"cx{i + 1:02d}",
+            "label": f"Custom {i + 1}",
+            "label_ko": f"Custom {i + 1}",
+            "prompt": text,
+            "category": "custom",
+        })
+    return merged
+
 
 # ---------------------------------------------------------------------------
 # Prompt Dictionary Data
@@ -1123,194 +1064,11 @@ PROMPT_DICTIONARY = {
     },
 }
 
-# ---------------------------------------------------------------------------
-# Composite Sheet Constants
-# ---------------------------------------------------------------------------
-
-COMPOSITE_PADDING = 16
-COMPOSITE_BORDER = 24
-COMPOSITE_HEADER_HEIGHT = 60
-COMPOSITE_LABEL_HEIGHT = 36
-COMPOSITE_BG_COLOR = (240, 240, 240)
-COMPOSITE_TEXT_COLOR = (50, 50, 50)
-COMPOSITE_LABEL_COLOR = (110, 110, 110)
-
-# Composite layout: face column (left) + body row (right)
-COMPOSITE_FACE_COLUMN = ["face_left", "face_front", "face_right"]
-COMPOSITE_BODY_ROW = ["full_body_front", "full_body_left", "full_body_right", "full_body_back"]
-
-# ---------------------------------------------------------------------------
-# Client initialization (reused from terrymcpnanobanana)
-# ---------------------------------------------------------------------------
-
-_client = None
 
 
-def _get_client() -> genai.Client:
-    """Lazy-initialize the GenAI client."""
-    global _client
-    if _client is None:
-        if USE_VERTEX_AI:
-            _client = genai.Client(
-                vertexai=True,
-                project=VERTEX_PROJECT,
-                location=VERTEX_LOCATION,
-            )
-        else:
-            _client = genai.Client()
-    return _client
 
 
-def _resolve_model(model: str) -> str:
-    """Resolve a short model key ('flash'/'pro') to the full model ID."""
-    key = model.lower().strip()
-    if key not in MODELS:
-        raise ValueError(
-            f"Unknown model '{model}'. Valid options: {sorted(MODELS.keys())}"
-        )
-    return MODELS[key]
 
-
-def _validate_params(
-    model_key: str,
-    aspect_ratio: str,
-    image_size: str,
-    output_format: str = "file",
-    person_generation: Optional[str] = None,
-    prominent_people: Optional[str] = None,
-    safety_level: Optional[str] = None,
-    thinking_level: Optional[str] = None,
-    temperature: Optional[float] = None,
-) -> list[str]:
-    """Validate parameters against allowed values. Returns list of errors."""
-    errors = []
-    is_flash = model_key.lower() == "flash"
-    valid_ratios = VALID_ASPECT_RATIOS_FLASH if is_flash else VALID_ASPECT_RATIOS_PRO
-    valid_sizes = VALID_IMAGE_SIZES_FLASH if is_flash else VALID_IMAGE_SIZES_PRO
-
-    if aspect_ratio not in valid_ratios:
-        errors.append(
-            f"Invalid aspect_ratio '{aspect_ratio}' for {model_key}. "
-            f"Valid: {sorted(valid_ratios)}"
-        )
-    if image_size not in valid_sizes:
-        errors.append(
-            f"Invalid image_size '{image_size}' for {model_key}. "
-            f"Valid: {sorted(valid_sizes)}"
-        )
-    if output_format not in VALID_OUTPUT_FORMATS:
-        errors.append(
-            f"Invalid output_format '{output_format}'. Valid: {sorted(VALID_OUTPUT_FORMATS)}"
-        )
-    if person_generation is not None and person_generation not in VALID_PERSON_GENERATION:
-        errors.append(
-            f"Invalid person_generation '{person_generation}'. "
-            f"Valid: {sorted(VALID_PERSON_GENERATION)}"
-        )
-    if prominent_people is not None and prominent_people not in VALID_PROMINENT_PEOPLE:
-        errors.append(
-            f"Invalid prominent_people '{prominent_people}'. "
-            f"Valid: {sorted(VALID_PROMINENT_PEOPLE)}"
-        )
-    if safety_level is not None and safety_level not in VALID_SAFETY_LEVELS:
-        errors.append(
-            f"Invalid safety_level '{safety_level}'. Valid: {sorted(VALID_SAFETY_LEVELS)}"
-        )
-    if thinking_level is not None:
-        if not is_flash:
-            errors.append("thinking_level is only supported with the 'flash' model.")
-        elif thinking_level not in VALID_THINKING_LEVELS:
-            errors.append(
-                f"Invalid thinking_level '{thinking_level}'. "
-                f"Valid: {sorted(VALID_THINKING_LEVELS)}"
-            )
-    if temperature is not None and not 0.0 <= temperature <= 2.0:
-        errors.append(f"temperature must be 0.0-2.0, got {temperature}.")
-
-    return errors
-
-
-# ---------------------------------------------------------------------------
-# Config builder (reused from terrymcpnanobanana)
-# ---------------------------------------------------------------------------
-
-def _build_config(
-    model_key: str = DEFAULT_MODEL,
-    aspect_ratio: str = "1:1",
-    image_size: str = "1K",
-    number_of_images: int = 1,
-    person_generation: Optional[str] = None,
-    prominent_people: Optional[str] = None,
-    temperature: Optional[float] = None,
-    seed: Optional[int] = None,
-    safety_level: Optional[str] = None,
-    thinking_level: Optional[str] = None,
-    use_search: bool = False,
-) -> types.GenerateContentConfig:
-    """Build GenerateContentConfig with full ImageConfig options."""
-    is_flash = model_key.lower() == "flash"
-
-    image_cfg_kwargs = {
-        "aspect_ratio": aspect_ratio,
-        "image_size": image_size,
-    }
-
-    if USE_VERTEX_AI:
-        image_cfg_kwargs["output_mime_type"] = OUTPUT_MIME_TYPE
-        image_cfg_kwargs["output_compression_quality"] = OUTPUT_COMPRESSION_QUALITY
-        if person_generation is not None:
-            image_cfg_kwargs["person_generation"] = person_generation
-        if prominent_people is not None:
-            image_cfg_kwargs["prominent_people"] = prominent_people
-
-    config_kwargs = {
-        "response_modalities": ["TEXT", "IMAGE"],
-        "image_config": types.ImageConfig(**image_cfg_kwargs),
-        "candidate_count": number_of_images,
-    }
-
-    if temperature is not None:
-        config_kwargs["temperature"] = temperature
-    if seed is not None:
-        config_kwargs["seed"] = seed
-
-    if safety_level is not None:
-        config_kwargs["safety_settings"] = [
-            types.SafetySetting(
-                category="HARM_CATEGORY_HARASSMENT",
-                threshold=safety_level,
-            ),
-            types.SafetySetting(
-                category="HARM_CATEGORY_HATE_SPEECH",
-                threshold=safety_level,
-            ),
-            types.SafetySetting(
-                category="HARM_CATEGORY_SEXUALLY_EXPLICIT",
-                threshold=safety_level,
-            ),
-            types.SafetySetting(
-                category="HARM_CATEGORY_DANGEROUS_CONTENT",
-                threshold=safety_level,
-            ),
-        ]
-
-    if is_flash and thinking_level is not None:
-        config_kwargs["thinking_config"] = types.ThinkingConfig(
-            thinking_level=thinking_level,
-            include_thoughts=True,
-        )
-
-    if is_flash and use_search:
-        config_kwargs["tools"] = [types.Tool(
-            google_search=types.GoogleSearch(
-                search_types=types.SearchTypes(
-                    web_search=types.WebSearch(),
-                    image_search=types.ImageSearch(),
-                )
-            )
-        )]
-
-    return types.GenerateContentConfig(**config_kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -1323,810 +1081,43 @@ def _ensure_output_dir() -> Path:
     return OUTPUT_DIR
 
 
-def _ensure_design_dir(character_name: str) -> Path:
-    """Create and return a character-specific output directory."""
-    safe_name = "".join(
-        c if c.isalnum() or c in ("-", "_", " ") else "_"
-        for c in character_name
-    ).strip().replace(" ", "_")[:50]
+# Convenience wrappers that bind server-level constants to module functions
+_VALIDATE_KW = dict(
+    valid_ratios_flash=VALID_ASPECT_RATIOS_FLASH,
+    valid_ratios_pro=VALID_ASPECT_RATIOS_PRO,
+    valid_sizes_flash=VALID_IMAGE_SIZES_FLASH,
+    valid_sizes_pro=VALID_IMAGE_SIZES_PRO,
+    valid_formats=VALID_OUTPUT_FORMATS,
+    valid_person_gen=VALID_PERSON_GENERATION,
+    valid_prominent=VALID_PROMINENT_PEOPLE,
+    valid_safety=VALID_SAFETY_LEVELS,
+    valid_thinking=VALID_THINKING_LEVELS,
+)
 
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    char_dir = OUTPUT_DIR / f"{safe_name}_{timestamp}"
-    char_dir.mkdir(parents=True, exist_ok=True)
-    return char_dir
 
+_BUILD_CONFIG_KW = dict(
+    use_vertex_ai=USE_VERTEX_AI,
+    output_mime_type=OUTPUT_MIME_TYPE,
+    output_compression_quality=OUTPUT_COMPRESSION_QUALITY,
+)
 
-def _save_image(
-    image_data: bytes,
-    prefix: str = "generated",
-    output_dir: Optional[Path] = None,
-) -> str:
-    """Save image bytes to a file and return the absolute path."""
-    out_dir = output_dir or _ensure_output_dir()
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    short_id = uuid.uuid4().hex[:6]
-    filename = f"{prefix}_{timestamp}_{short_id}.jpg"
-    filepath = out_dir / filename
-    filepath.write_bytes(image_data)
-    return str(filepath)
 
 
-def _extract_results(
-    response,
-    output_format: str,
-    prefix: str,
-    output_dir: Optional[Path] = None,
-) -> dict:
-    """Extract text and images from a generate_content response."""
-    images = []
-    text = ""
-    thought = ""
 
-    for part in response.candidates[0].content.parts:
-        if hasattr(part, "thought") and part.thought:
-            thought += part.text or ""
-            continue
-        if part.text:
-            text += part.text
-        elif part.inline_data:
-            if output_format == "base64":
-                b64 = base64.b64encode(part.inline_data.data).decode("utf-8")
-                images.append({
-                    "format": "base64",
-                    "mime_type": part.inline_data.mime_type,
-                    "data": b64,
-                })
-            else:
-                filepath = _save_image(
-                    part.inline_data.data,
-                    prefix=prefix,
-                    output_dir=output_dir,
-                )
-                images.append({
-                    "format": "file",
-                    "path": filepath,
-                    "mime_type": part.inline_data.mime_type,
-                })
 
-    result = {"images": images, "text": text}
-    if thought:
-        result["thinking"] = thought
-    return result
 
 
-# ---------------------------------------------------------------------------
-# Safety filter retry helpers
-# ---------------------------------------------------------------------------
 
-_SAFETY_KEYWORDS = frozenset([
-    "safety", "blocked", "responsible ai", "policy", "harm",
-    "content filtered", "violated", "not allowed",
-])
 
 
-def _is_safety_block_error(exc: Exception) -> bool:
-    """Check if an exception indicates a safety filter block."""
-    msg = str(exc).lower()
-    return any(kw in msg for kw in _SAFETY_KEYWORDS)
 
 
-def _is_safety_block_response(response) -> bool:
-    """Check if a generate_content response was safety-filtered (no images)."""
-    try:
-        if hasattr(response, "prompt_feedback"):
-            pf = response.prompt_feedback
-            if pf and hasattr(pf, "block_reason") and pf.block_reason:
-                return True
-        if hasattr(response, "candidates") and response.candidates:
-            c = response.candidates[0]
-            if hasattr(c, "finish_reason"):
-                fr = str(c.finish_reason).upper()
-                if "SAFETY" in fr or "BLOCKED" in fr:
-                    return True
-            # Response came back but has no image content
-            if hasattr(c, "content") and c.content and hasattr(c.content, "parts"):
-                has_image = any(
-                    hasattr(p, "inline_data") and p.inline_data
-                    for p in c.content.parts
-                )
-                if not has_image:
-                    return False  # No image but not necessarily safety block
-            elif not hasattr(c, "content") or not c.content:
-                return True  # Empty content likely safety block
-        elif hasattr(response, "candidates") and not response.candidates:
-            return True  # No candidates at all
-    except (IndexError, AttributeError):
-        pass
-    return False
-
-
-def _soften_prompt(contents, attempt: int):
-    """Append a softening suffix to the text portion of contents for retry."""
-    idx = min(attempt - 1, len(SOFTENING_SUFFIXES) - 1)
-    suffix = SOFTENING_SUFFIXES[idx]
-
-    if isinstance(contents, str):
-        return contents + suffix
-
-    if isinstance(contents, list):
-        new_contents = list(contents)
-        # Find the last string element and append suffix
-        for i in range(len(new_contents) - 1, -1, -1):
-            if isinstance(new_contents[i], str):
-                new_contents[i] = new_contents[i] + suffix
-                return new_contents
-        # No string found -- append as new element
-        new_contents.append(suffix.strip())
-        return new_contents
-
-    return contents
-
-
-def _generate_with_retry(
-    client,
-    model_id: str,
-    contents,
-    config: types.GenerateContentConfig,
-    max_retries: int = DEFAULT_MAX_RETRIES,
-    on_block: str = DEFAULT_ON_BLOCK,
-):
-    """Generate content with automatic retry on safety filter blocks.
-
-    Returns the response object from generate_content.
-    Raises RuntimeError if all retries exhausted or on_block="stop".
-    """
-    for attempt in range(max_retries + 1):
-        current_contents = contents if attempt == 0 else _soften_prompt(contents, attempt)
-
-        try:
-            response = client.models.generate_content(
-                model=model_id,
-                contents=current_contents,
-                config=config,
-            )
-
-            # Check response-level safety block
-            if _is_safety_block_response(response):
-                if on_block == "stop":
-                    raise RuntimeError(
-                        "Safety filter blocked generation. "
-                        "on_block='stop' -- not retrying. "
-                        "Try adjusting the character description or style."
-                    )
-                if attempt < max_retries:
-                    time.sleep(1)  # Brief delay before retry
-                    continue
-                raise RuntimeError(
-                    f"Safety filter blocked generation after {max_retries} retries. "
-                    "Consider adjusting the character description or style."
-                )
-
-            return response
-
-        except RuntimeError:
-            raise  # Re-raise our own RuntimeError
-        except Exception as e:
-            if _is_safety_block_error(e):
-                if on_block == "stop":
-                    raise RuntimeError(
-                        f"Safety filter blocked: {e}. "
-                        "on_block='stop' -- not retrying."
-                    ) from e
-                if attempt < max_retries:
-                    time.sleep(1)
-                    continue
-                raise RuntimeError(
-                    f"Safety filter blocked after {max_retries} retries: {e}. "
-                    "Consider adjusting the character description or style."
-                ) from e
-            raise  # Non-safety error, raise immediately
-
-    raise RuntimeError("Generation failed after all retry attempts.")
-
-
-# ---------------------------------------------------------------------------
-# Prompt builder
-# ---------------------------------------------------------------------------
-
-def _build_character_prompt(
-    shot_type: str,
-    character_description: str,
-    outfit_description: str,
-    style: str,
-    hair_description: Optional[str] = None,
-    accessories: Optional[str] = None,
-    makeup_description: Optional[str] = None,
-    distinguishing_features: Optional[str] = None,
-    expression: Optional[str] = None,
-    age_range: Optional[str] = None,
-    body_type: Optional[str] = None,
-    background_description: Optional[str] = None,
-    color_palette: Optional[str] = None,
-) -> str:
-    """Build a complete prompt for a specific shot type from character details."""
-    # Assemble character block from all detail fields
-    parts = []
-
-    if age_range:
-        parts.append(age_range)
-
-    parts.append(character_description)
-
-    if body_type:
-        parts.append(f"{body_type} body type")
-    if hair_description:
-        parts.append(f"Hair: {hair_description}")
-    if makeup_description:
-        parts.append(f"Makeup: {makeup_description}")
-    if accessories:
-        parts.append(f"Wearing accessories: {accessories}")
-    if distinguishing_features:
-        parts.append(distinguishing_features)
-
-    character_block = ". ".join(parts)
-
-    # Format the shot-specific template
-    return SHOT_PROMPTS[shot_type].format(
-        character=character_block,
-        outfit=outfit_description,
-        expression=expression or "neutral, calm",
-        background=background_description or DEFAULT_BACKGROUND,
-        style=style,
-        color_palette=f"Use a {color_palette} color scheme. " if color_palette else "",
-    )
-
-
-# ---------------------------------------------------------------------------
-# Composite Sheet Builder
-# ---------------------------------------------------------------------------
-
-def _create_composite_sheet(
-    shot_images: dict[str, str],
-    character_name: str,
-    style: str,
-    output_dir: Path,
-) -> Optional[str]:
-    """Create a composite character reference sheet from individual shot images.
-
-    Layout:
-        [face_left  ] [full_body_front] [full_body_left] [full_body_right] [full_body_back]
-        [face_front ] [               ] [              ] [               ] [              ]
-        [face_right ] [               ] [              ] [               ] [              ]
-
-    Face shots stacked vertically on the left, full body shots fill the right.
-    """
-    # Load available images
-    loaded = {}
-    for shot_type in COMPOSITE_FACE_COLUMN + COMPOSITE_BODY_ROW:
-        path = shot_images.get(shot_type)
-        if path and Path(path).exists():
-            loaded[shot_type] = Image.open(path)
-
-    if not loaded:
-        return None
-
-    # Determine target height from the first available full body image
-    body_height = None
-    for s in COMPOSITE_BODY_ROW:
-        if s in loaded:
-            body_height = loaded[s].height
-            break
-
-    if body_height is None:
-        # Fallback: derive from face images
-        for s in COMPOSITE_FACE_COLUMN:
-            if s in loaded:
-                body_height = loaded[s].height * 3 + COMPOSITE_PADDING * 2
-                break
-        if body_height is None:
-            return None
-
-    pad = COMPOSITE_PADDING
-    border = COMPOSITE_BORDER
-    header_h = COMPOSITE_HEADER_HEIGHT
-    label_h = COMPOSITE_LABEL_HEIGHT
-
-    # Scale full body images to uniform height
-    body_scaled = []
-    for s in COMPOSITE_BODY_ROW:
-        if s in loaded:
-            img = loaded[s]
-            scale = body_height / img.height
-            new_w = int(img.width * scale)
-            body_scaled.append((s, img.resize((new_w, body_height), Image.LANCZOS)))
-        else:
-            body_scaled.append((s, None))
-
-    # Face size: 3 faces + 2 gaps = body_height
-    face_size = (body_height - 2 * pad) // 3
-    face_scaled = []
-    for s in COMPOSITE_FACE_COLUMN:
-        if s in loaded:
-            face_scaled.append(
-                (s, loaded[s].resize((face_size, face_size), Image.LANCZOS))
-            )
-        else:
-            face_scaled.append((s, None))
-
-    # Calculate canvas dimensions
-    available_body = [(s, img) for s, img in body_scaled if img is not None]
-    total_body_w = (
-        sum(img.width for _, img in available_body)
-        + pad * max(len(available_body) - 1, 0)
-    ) if available_body else 0
-
-    canvas_w = border * 2 + face_size + pad + total_body_w
-    canvas_h = border * 2 + header_h + body_height + label_h
-
-    canvas = Image.new("RGB", (canvas_w, canvas_h), COMPOSITE_BG_COLOR)
-    draw = ImageDraw.Draw(canvas)
-
-    # Load fonts: English for header, Korean for labels
-    font_header, font_label = _load_fonts(32, 15)
-
-    # Draw header
-    header_text = character_name
-    if style:
-        header_text += f"  |  {style}"
-    draw.text(
-        (border, border + (header_h - 36) // 2),
-        header_text,
-        fill=COMPOSITE_TEXT_COLOR,
-        font=font_header,
-    )
-
-    y_top = border + header_h
-
-    # Draw face column (left, stacked vertically)
-    x_face = border
-    for i, (shot_type, img) in enumerate(face_scaled):
-        y = y_top + i * (face_size + pad)
-        if img is not None:
-            canvas.paste(img, (x_face, y))
-
-    # Face column label (centered below the column)
-    face_label = "얼굴 좌 / 정 / 우"
-    bbox = draw.textbbox((0, 0), face_label, font=font_label)
-    text_w = bbox[2] - bbox[0]
-    draw.text(
-        (x_face + (face_size - text_w) // 2, y_top + body_height + 6),
-        face_label,
-        fill=COMPOSITE_LABEL_COLOR,
-        font=font_label,
-    )
-
-    # Draw body shots (right of face column)
-    x = border + face_size + pad
-    for shot_type, img in body_scaled:
-        if img is not None:
-            canvas.paste(img, (x, y_top))
-            # Label centered below image
-            label = SHOT_DEFINITIONS[shot_type]["label_ko"]
-            bbox = draw.textbbox((0, 0), label, font=font_label)
-            text_w = bbox[2] - bbox[0]
-            draw.text(
-                (x + (img.width - text_w) // 2, y_top + body_height + 6),
-                label,
-                fill=COMPOSITE_LABEL_COLOR,
-                font=font_label,
-            )
-            x += img.width + pad
-
-    # Save composite
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    composite_path = output_dir / f"composite_sheet_{timestamp}.jpg"
-    canvas.save(composite_path, "JPEG", quality=95)
-
-    return str(composite_path)
-
-
-# ---------------------------------------------------------------------------
-# Composite Row Builder (basic / face_angles modes)
-# ---------------------------------------------------------------------------
-
-def _create_composite_row(
-    shot_images: dict[str, str],
-    shot_order: list[str],
-    character_name: str,
-    mode: str,
-    output_dir: Path,
-) -> Optional[str]:
-    """Create a horizontal row composite from a small set of shot images.
-
-    Used for output_mode='basic' and output_mode='face_angles'.
-    Layout: images arranged side-by-side with 8px gap, scaled to uniform height.
-    Header "{character_name} — {mode}" above, Korean labels below each image.
-    """
-    # Load available images in shot_order
-    loaded = []
-    for shot_type in shot_order:
-        path = shot_images.get(shot_type)
-        if path and Path(path).exists():
-            loaded.append((shot_type, Image.open(path)))
-
-    if not loaded:
-        return None
-
-    gap = 8
-    border = 20
-    header_h = 44
-    label_h = 28
-
-    # Determine target height: tallest image height
-    target_h = max(img.height for _, img in loaded)
-
-    # Scale all images to target_h (proportional)
-    scaled = []
-    for shot_type, img in loaded:
-        scale = target_h / img.height
-        new_w = int(img.width * scale)
-        scaled.append((shot_type, img.resize((new_w, target_h), Image.LANCZOS)))
-
-    # Canvas dimensions
-    total_w = sum(img.width for _, img in scaled) + gap * max(len(scaled) - 1, 0)
-    canvas_w = border * 2 + total_w
-    canvas_h = border * 2 + header_h + target_h + label_h
-
-    canvas = Image.new("RGB", (canvas_w, canvas_h), COMPOSITE_BG_COLOR)
-    draw = ImageDraw.Draw(canvas)
-
-    # Load fonts
-    font_header, font_label = _load_fonts(28, 14)
-
-    # Draw header
-    header_text = f"{character_name} \u2014 {mode}"
-    draw.text(
-        (border, border + (header_h - 32) // 2),
-        header_text,
-        fill=COMPOSITE_TEXT_COLOR,
-        font=font_header,
-    )
-
-    y_top = border + header_h
-
-    # Draw images and labels
-    x = border
-    for shot_type, img in scaled:
-        canvas.paste(img, (x, y_top))
-        label = SHOT_DEFINITIONS[shot_type]["label_ko"]
-        bbox = draw.textbbox((0, 0), label, font=font_label)
-        text_w = bbox[2] - bbox[0]
-        draw.text(
-            (x + (img.width - text_w) // 2, y_top + target_h + 6),
-            label,
-            fill=COMPOSITE_LABEL_COLOR,
-            font=font_label,
-        )
-        x += img.width + gap
-
-    # Save composite
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    composite_path = output_dir / f"composite_row_{mode}_{timestamp}.jpg"
-    canvas.save(composite_path, "JPEG", quality=95)
-
-    return str(composite_path)
 
 
 # ---------------------------------------------------------------------------
 # Pose Grid Sheet Builder
 # ---------------------------------------------------------------------------
 
-def _load_fonts(header_size: int = 24, label_size: int = 13):
-    """Load cross-platform fonts for EN header and KO labels."""
-    _en_candidates = [
-        "/System/Library/Fonts/Helvetica.ttc",
-        "/System/Library/Fonts/SFNSText.ttf",
-        "C:/Windows/Fonts/segoeui.ttf",
-        "C:/Windows/Fonts/arial.ttf",
-    ]
-    _ko_candidates = [
-        "/System/Library/Fonts/AppleSDGothicNeo.ttc",
-        "/System/Library/Fonts/Supplemental/AppleGothic.ttf",
-        "C:/Windows/Fonts/malgun.ttf",
-        "C:/Windows/Fonts/gulim.ttc",
-    ]
-    font_header = None
-    for fp in _en_candidates:
-        try:
-            font_header = ImageFont.truetype(fp, header_size)
-            break
-        except OSError:
-            continue
-    font_label = None
-    for fp in _ko_candidates:
-        try:
-            font_label = ImageFont.truetype(fp, label_size)
-            break
-        except OSError:
-            continue
-    if font_header is None:
-        font_header = ImageFont.load_default()
-    if font_label is None:
-        font_label = ImageFont.load_default()
-    return font_header, font_label
-
-
-def _create_pose_grid_sheet(
-    pose_images: dict,
-    pose_labels: dict,
-    character_name: str,
-    style: str,
-    output_dir: Path,
-    columns: int = 4,
-) -> Optional[str]:
-    """Create a composite grid sheet from pose images.
-
-    Args:
-        pose_images: {pose_key: file_path}
-        pose_labels: {pose_key: label_ko}
-        character_name: For header title.
-        style: Art style for header.
-        output_dir: Output directory.
-        columns: Grid columns (default 4).
-
-    Returns:
-        Path to composite sheet or None.
-    """
-    if not pose_images:
-        return None
-
-    # Determine ordered keys (preserve insertion order)
-    keys = [k for k in pose_images if Path(pose_images[k]).exists()]
-    if not keys:
-        return None
-
-    # Load and resize all images to uniform size
-    cell_size = None
-    loaded = {}
-    for k in keys:
-        img = Image.open(pose_images[k])
-        if cell_size is None:
-            cell_size = min(img.width, img.height)
-        loaded[k] = img
-
-    # Resize all to square cells
-    for k in loaded:
-        img = loaded[k]
-        scale = cell_size / max(img.width, img.height)
-        new_w = int(img.width * scale)
-        new_h = int(img.height * scale)
-        loaded[k] = img.resize((new_w, new_h), Image.LANCZOS)
-
-    pad = POSE_SHEET_GRID_PADDING
-    border = POSE_SHEET_GRID_BORDER
-    header_h = POSE_SHEET_HEADER_HEIGHT
-    label_h = POSE_SHEET_LABEL_HEIGHT
-
-    cols = min(columns, len(keys))
-    rows = (len(keys) + cols - 1) // cols
-
-    canvas_w = border * 2 + cols * cell_size + (cols - 1) * pad
-    canvas_h = border * 2 + header_h + rows * (cell_size + label_h + pad) - pad
-
-    canvas = Image.new("RGB", (canvas_w, canvas_h), POSE_SHEET_BG_COLOR)
-    draw = ImageDraw.Draw(canvas)
-
-    font_header, font_label = _load_fonts(24, 13)
-
-    # Header
-    header_text = f"{character_name}  |  Pose Sheet  |  {style}"
-    draw.text(
-        (border, border + (header_h - 28) // 2),
-        header_text,
-        fill=COMPOSITE_TEXT_COLOR,
-        font=font_header,
-    )
-
-    # Place images in grid
-    for idx, key in enumerate(keys):
-        row = idx // cols
-        col = idx % cols
-        x = border + col * (cell_size + pad)
-        y = border + header_h + row * (cell_size + label_h + pad)
-
-        img = loaded[key]
-        # Center image in cell
-        x_offset = (cell_size - img.width) // 2
-        y_offset = (cell_size - img.height) // 2
-        canvas.paste(img, (x + x_offset, y + y_offset))
-
-        # Label below
-        label = pose_labels.get(key, key)
-        bbox = draw.textbbox((0, 0), label, font=font_label)
-        text_w = bbox[2] - bbox[0]
-        draw.text(
-            (x + (cell_size - text_w) // 2, y + cell_size + 4),
-            label,
-            fill=COMPOSITE_LABEL_COLOR,
-            font=font_label,
-        )
-
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    sheet_path = output_dir / f"pose_sheet_{timestamp}.jpg"
-    canvas.save(sheet_path, "JPEG", quality=95)
-    return str(sheet_path)
-
-
-# ---------------------------------------------------------------------------
-# Emoji Helpers
-# ---------------------------------------------------------------------------
-
-def _remove_chroma_key_background(
-    image_path: str,
-    chroma_color: tuple = EMOJI_CHROMA_COLOR,
-    tolerance: int = EMOJI_CHROMA_TOLERANCE,
-) -> Image.Image:
-    """Remove chroma key background and return RGBA image with transparency.
-
-    Converts green-screen pixels to transparent based on color distance.
-    """
-    img = Image.open(image_path).convert("RGBA")
-    data = img.getdata()
-    new_data = []
-    cr, cg, cb = chroma_color
-    for r, g, b, a in data:
-        dist = ((r - cr) ** 2 + (g - cg) ** 2 + (b - cb) ** 2) ** 0.5
-        if dist < tolerance:
-            new_data.append((r, g, b, 0))
-        else:
-            new_data.append((r, g, b, a))
-    img.putdata(new_data)
-    return img
-
-
-def _resize_for_platform(
-    image: Image.Image,
-    platform_key: str,
-    output_dir: Path,
-    prefix: str,
-) -> str:
-    """Resize image to platform-specific dimensions and format.
-
-    Handles dimension resize, format conversion, and file size optimization.
-    Returns path to the platform-optimized file.
-    """
-    spec = EMOJI_PLATFORMS[platform_key]
-    target_w, target_h = spec["size"]
-    fmt = spec["format"]
-    max_kb = spec["max_size_kb"]
-
-    # Resize with LANCZOS
-    resized = image.resize((target_w, target_h), Image.LANCZOS)
-
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    short_id = uuid.uuid4().hex[:6]
-
-    if fmt == "webp":
-        filename = f"{prefix}_{timestamp}_{short_id}.webp"
-        filepath = output_dir / filename
-
-        # Quality reduction loop for file size limit
-        quality = 90
-        while quality >= 20:
-            resized.save(filepath, "WEBP", quality=quality)
-            if max_kb is None or filepath.stat().st_size / 1024 <= max_kb:
-                break
-            quality -= 10
-    else:
-        # PNG (lossless, supports transparency)
-        filename = f"{prefix}_{timestamp}_{short_id}.png"
-        filepath = output_dir / filename
-        resized.save(filepath, "PNG")
-
-        # If file too large, try reducing by palette quantization
-        if max_kb is not None and filepath.stat().st_size / 1024 > max_kb:
-            quantized = resized.quantize(colors=256, method=Image.Quantize.MEDIANCUT)
-            quantized = quantized.convert("RGBA")
-            quantized.save(filepath, "PNG")
-
-    return str(filepath)
-
-
-def _create_emoji_grid_sheet(
-    emoji_images: dict,
-    emoji_labels: dict,
-    character_name: str,
-    platform: str,
-    output_dir: Path,
-    columns: int = 4,
-) -> Optional[str]:
-    """Create a composite preview grid of all generated emoji.
-
-    Args:
-        emoji_images: {expression_key: file_path}
-        emoji_labels: {expression_key: label_ko}
-        character_name: For header title.
-        platform: Platform name for header.
-        output_dir: Output directory.
-        columns: Grid columns (default 4).
-
-    Returns:
-        Path to composite preview sheet or None.
-    """
-    if not emoji_images:
-        return None
-
-    keys = [k for k in emoji_images if Path(emoji_images[k]).exists()]
-    if not keys:
-        return None
-
-    # Load images (use originals, not platform-resized, for readable preview)
-    loaded = {}
-    preview_size = 128  # Preview cell size for grid
-    for k in keys:
-        img = Image.open(emoji_images[k]).convert("RGBA")
-        img = img.resize((preview_size, preview_size), Image.LANCZOS)
-        loaded[k] = img
-
-    pad = EMOJI_GRID_PADDING
-    border = EMOJI_GRID_BORDER
-    header_h = EMOJI_GRID_HEADER_HEIGHT
-    label_h = EMOJI_GRID_LABEL_HEIGHT
-
-    cols = min(columns, len(keys))
-    rows = (len(keys) + cols - 1) // cols
-
-    canvas_w = border * 2 + cols * preview_size + (cols - 1) * pad
-    canvas_h = border * 2 + header_h + rows * (preview_size + label_h + pad) - pad
-
-    canvas = Image.new("RGB", (canvas_w, canvas_h), EMOJI_GRID_BG_COLOR)
-    draw = ImageDraw.Draw(canvas)
-
-    font_header, font_label = _load_fonts(20, 11)
-
-    # Header
-    platform_label = EMOJI_PLATFORMS.get(platform, {}).get("label", platform)
-    header_text = f"{character_name}  |  Emoji  |  {platform_label}"
-    draw.text(
-        (border, border + (header_h - 24) // 2),
-        header_text,
-        fill=COMPOSITE_TEXT_COLOR,
-        font=font_header,
-    )
-
-    # Place emoji in grid
-    for idx, key in enumerate(keys):
-        row = idx // cols
-        col = idx % cols
-        x = border + col * (preview_size + pad)
-        y = border + header_h + row * (preview_size + label_h + pad)
-
-        img = loaded[key]
-        # Paste with transparency handling
-        bg = Image.new("RGB", (preview_size, preview_size), EMOJI_GRID_BG_COLOR)
-        bg.paste(img, mask=img.split()[3] if img.mode == "RGBA" else None)
-        canvas.paste(bg, (x, y))
-
-        # Label
-        label = emoji_labels.get(key, key)
-        bbox = draw.textbbox((0, 0), label, font=font_label)
-        text_w = bbox[2] - bbox[0]
-        draw.text(
-            (x + (preview_size - text_w) // 2, y + preview_size + 3),
-            label,
-            fill=COMPOSITE_LABEL_COLOR,
-            font=font_label,
-        )
-
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    sheet_path = output_dir / f"emoji_preview_sheet_{timestamp}.jpg"
-    canvas.save(sheet_path, "JPEG", quality=95)
-    return str(sheet_path)
-
-
-def _save_image_png(
-    image_data: bytes,
-    prefix: str = "generated",
-    output_dir: Optional[Path] = None,
-) -> str:
-    """Save image bytes as PNG (for emoji with chroma key processing)."""
-    out_dir = output_dir or _ensure_output_dir()
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    short_id = uuid.uuid4().hex[:6]
-    filename = f"{prefix}_{timestamp}_{short_id}_raw.jpg"
-    filepath = out_dir / filename
-    filepath.write_bytes(image_data)
-    return str(filepath)
 
 
 # ---------------------------------------------------------------------------
@@ -2243,6 +1234,8 @@ def design_character(
         JSON with character_name, output_dir, per-shot results, composite
         sheet path, summary counts, and generation settings.
     """
+    start_time = time.time()
+
     # --- Profile loading ---
     # When a profile is specified, load its defaults for any parameter not
     # explicitly provided by the caller. This is additive: when no profile
@@ -2274,7 +1267,7 @@ def design_character(
 
     # Convert NAS paths for cross-platform compatibility
     if reference_images:
-        reference_images = _convert_nas_paths(reference_images)
+        reference_images = convert_nas_paths(reference_images)
 
     # Ensure required parameters have values after profile loading
     if not character_description:
@@ -2308,7 +1301,7 @@ def design_character(
 
     # Resolve model
     try:
-        model_id = _resolve_model(model)
+        model_id = resolve_model(model, MODELS)
     except ValueError as e:
         return json.dumps({"error": str(e)})
 
@@ -2339,7 +1332,7 @@ def design_character(
         (s for s in selected_shots if SHOT_DEFINITIONS[s].get("is_anchor")),
         selected_shots[0],
     )
-    errors = _validate_params(
+    errors = validate_params(
         model_key=model,
         aspect_ratio=SHOT_DEFINITIONS[anchor_shot]["aspect_ratio"],
         image_size=image_size,
@@ -2349,6 +1342,7 @@ def design_character(
         safety_level=safety_level,
         thinking_level=thinking_level,
         temperature=temperature,
+        **_VALIDATE_KW,
     )
     # Also validate all other shot aspect ratios
     for s in selected_shots:
@@ -2366,7 +1360,7 @@ def design_character(
         return json.dumps({"errors": errors})
 
     # Create character output directory
-    char_dir = _ensure_design_dir(character_name)
+    char_dir = ensure_design_dir(character_name, OUTPUT_DIR)
 
     # Load user-provided reference images
     user_ref_parts = []
@@ -2386,7 +1380,7 @@ def design_character(
                 types.Part.from_bytes(data=ref.read_bytes(), mime_type=mime_type)
             )
 
-    client = _get_client()
+    client = get_client(USE_VERTEX_AI, VERTEX_PROJECT, VERTEX_LOCATION)
     results = {}
     warnings = []
     anchor_image_path = None
@@ -2400,7 +1394,7 @@ def design_character(
         # Build the shot prompt
         # Use build_prompt() from prompts.py when a camera/style preset is
         # resolved (photorealistic or animation styles).  Fall back to the
-        # legacy _build_character_prompt() for other styles so that existing
+        # legacy build_character_prompt() for other styles so that existing
         # behaviour is preserved.
         if resolved_preset is not None or style in PHOTOREALISTIC_STYLES or style in ANIMATION_STYLES:
             # Assemble a character description block (same logic as
@@ -2442,7 +1436,7 @@ def design_character(
                 ethereal=_is_ethereal,
             )
         else:
-            shot_prompt = _build_character_prompt(
+            shot_prompt = build_character_prompt(
                 shot_type=shot_type,
                 character_description=character_description,
                 outfit_description=outfit_description,
@@ -2456,10 +1450,12 @@ def design_character(
                 body_type=body_type,
                 background_description=background_description,
                 color_palette=color_palette,
+                shot_prompts=SHOT_PROMPTS,
+                default_background=DEFAULT_BACKGROUND,
             )
 
         # Build config with shot-specific aspect ratio
-        shot_config = _build_config(
+        shot_config = build_config(
             model_key=model,
             aspect_ratio=shot_def["aspect_ratio"],
             image_size=image_size,
@@ -2470,6 +1466,7 @@ def design_character(
             seed=seed,
             safety_level=safety_level,
             thinking_level=thinking_level,
+            **_BUILD_CONFIG_KW,
         )
 
         # Build content parts
@@ -2489,12 +1486,12 @@ def design_character(
             contents = content_parts
 
         try:
-            response = _generate_with_retry(
+            response = generate_with_retry(
                 client, model_id, contents, shot_config,
                 max_retries=max_retries, on_block=on_block,
             )
 
-            extracted = _extract_results(
+            extracted = extract_results(
                 response, output_format, prefix=shot_type, output_dir=char_dir,
             )
 
@@ -2615,24 +1612,35 @@ def design_character(
         # basic / face_angles → simpler horizontal row
         effective_mode = output_mode if shots is None else "full_sheet"
         if effective_mode == "full_sheet":
-            composite_path = _create_composite_sheet(
+            composite_path = create_composite_sheet(
                 shot_images=shot_image_map,
                 character_name=character_name,
                 style=style,
                 output_dir=char_dir,
+                shot_definitions=SHOT_DEFINITIONS,
             )
         else:
-            composite_path = _create_composite_row(
+            composite_path = create_composite_row(
                 shot_images=shot_image_map,
                 shot_order=selected_shots,
                 character_name=character_name,
                 mode=effective_mode,
                 output_dir=char_dir,
+                shot_definitions=SHOT_DEFINITIONS,
             )
         if composite_path:
             final_result["composite_sheet"] = composite_path
 
-    return json.dumps(final_result, ensure_ascii=False, indent=2)
+    result_str = json.dumps(final_result, ensure_ascii=False, indent=2)
+    shot_count = final_result.get("summary", {}).get("completed", 0)
+    _report_telemetry(
+        server="terrychadesign", tool="design_character",
+        duration_ms=int((time.time() - start_time) * 1000),
+        input_summary={"character_name": character_name, "model": model, "size": image_size, "output_mode": output_mode},
+        output_summary={"shots_completed": shot_count, "shots_failed": final_result.get("summary", {}).get("failed", 0)},
+        estimated_cost_usd=(0.04 if image_size == "4K" else 0.02) * max(shot_count, 1),
+    )
+    return result_str
 
 
 @mcp.tool()
@@ -2689,25 +1697,28 @@ def add_character_pose(
         JSON with generated image path (or base64 data), model response text,
         and metadata.
     """
+    start_time = time.time()
+
     # Validate retry parameters
     if on_block not in VALID_ON_BLOCK:
         return json.dumps({"error": f"Invalid on_block: {on_block}. Valid: {sorted(VALID_ON_BLOCK)}"})
 
     try:
-        model_id = _resolve_model(model)
+        model_id = resolve_model(model, MODELS)
     except ValueError as e:
         return json.dumps({"error": str(e)})
 
-    errors = _validate_params(
+    errors = validate_params(
         model_key=model, aspect_ratio=aspect_ratio, image_size=image_size,
         output_format=output_format, person_generation=person_generation,
         prominent_people=prominent_people, safety_level=safety_level,
         thinking_level=thinking_level, temperature=temperature,
+        **_VALIDATE_KW,
     )
     if errors:
         return json.dumps({"errors": errors})
 
-    reference_images = _convert_nas_paths(reference_images)
+    reference_images = convert_nas_paths(reference_images)
 
     max_refs = 10 if model.lower() == "flash" else 14
     if len(reference_images) > max_refs:
@@ -2735,12 +1746,12 @@ def add_character_pose(
 
     # Determine output directory
     if character_name:
-        out_dir = _ensure_design_dir(character_name)
+        out_dir = ensure_design_dir(character_name, OUTPUT_DIR)
     else:
         out_dir = _ensure_output_dir()
 
-    client = _get_client()
-    config = _build_config(
+    client = get_client(USE_VERTEX_AI, VERTEX_PROJECT, VERTEX_LOCATION)
+    config = build_config(
         model_key=model,
         aspect_ratio=aspect_ratio,
         image_size=image_size,
@@ -2751,14 +1762,15 @@ def add_character_pose(
         seed=seed,
         safety_level=safety_level,
         thinking_level=thinking_level,
+        **_BUILD_CONFIG_KW,
     )
 
-    response = _generate_with_retry(
+    response = generate_with_retry(
         client, model_id, content_parts, config,
         max_retries=max_retries, on_block=on_block,
     )
 
-    extracted = _extract_results(response, output_format, prefix="pose", output_dir=out_dir)
+    extracted = extract_results(response, output_format, prefix="pose", output_dir=out_dir)
     result = {
         "prompt": prompt,
         "reference_count": len(reference_images),
@@ -2800,7 +1812,15 @@ def add_character_pose(
     except Exception:
         pass  # Don't fail generation if DB recording fails
 
-    return json.dumps(result, ensure_ascii=False, indent=2)
+    result_str = json.dumps(result, ensure_ascii=False, indent=2)
+    _report_telemetry(
+        server="terrychadesign", tool="add_character_pose",
+        duration_ms=int((time.time() - start_time) * 1000),
+        input_summary={"character_name": character_name, "prompt_length": len(prompt), "model": model, "size": image_size},
+        output_summary={"image_count": len(result.get("images", []))},
+        estimated_cost_usd=0.04 if image_size == "4K" else 0.02,
+    )
+    return result_str
 
 
 @mcp.tool()
@@ -2863,18 +1883,20 @@ def generate_pose_sheet(
     Returns:
         JSON with per-pose results, composite sheet path, and summary.
     """
+    start_time = time.time()
+
     # Validate retry parameters
     if on_block not in VALID_ON_BLOCK:
         return json.dumps({"error": f"Invalid on_block: {on_block}. Valid: {sorted(VALID_ON_BLOCK)}"})
 
     # Resolve model
     try:
-        model_id = _resolve_model(model)
+        model_id = resolve_model(model, MODELS)
     except ValueError as e:
         return json.dumps({"error": str(e)})
 
     # Validate parameters
-    errors = _validate_params(
+    errors = validate_params(
         model_key=model,
         aspect_ratio=POSE_SHEET_ASPECT_RATIO,
         image_size=image_size,
@@ -2882,6 +1904,7 @@ def generate_pose_sheet(
         person_generation=person_generation,
         safety_level=safety_level,
         temperature=temperature,
+        **_VALIDATE_KW,
     )
     if errors:
         return json.dumps({"errors": errors})
@@ -2917,7 +1940,7 @@ def generate_pose_sheet(
     if not reference_images:
         return json.dumps({"error": "At least one reference image is required."})
 
-    reference_images = _convert_nas_paths(reference_images)
+    reference_images = convert_nas_paths(reference_images)
 
     max_refs = 10 if model.lower() == "flash" else 14
     if len(reference_images) > max_refs:
@@ -2935,7 +1958,7 @@ def generate_pose_sheet(
         )
 
     # Create output directory
-    char_dir = _ensure_design_dir(f"{character_name}_poses")
+    char_dir = ensure_design_dir(f"{character_name}_poses", OUTPUT_DIR)
 
     # Build character block for prompts
     char_parts = []
@@ -2945,7 +1968,7 @@ def generate_pose_sheet(
         char_parts.append(outfit_description)
     character_block = ". ".join(char_parts) if char_parts else "the character"
 
-    client = _get_client()
+    client = get_client(USE_VERTEX_AI, VERTEX_PROJECT, VERTEX_LOCATION)
     results = {}
     warnings = []
 
@@ -2968,7 +1991,7 @@ def generate_pose_sheet(
         content_parts = list(ref_parts) + [full_prompt]
 
         # Build config
-        pose_config = _build_config(
+        pose_config = build_config(
             model_key=model,
             aspect_ratio=POSE_SHEET_ASPECT_RATIO,
             image_size=image_size,
@@ -2978,15 +2001,16 @@ def generate_pose_sheet(
             temperature=temperature,
             seed=seed,
             safety_level=safety_level,
+            **_BUILD_CONFIG_KW,
         )
 
         try:
-            response = _generate_with_retry(
+            response = generate_with_retry(
                 client, model_id, content_parts, pose_config,
                 max_retries=max_retries, on_block=on_block,
             )
 
-            extracted = _extract_results(
+            extracted = extract_results(
                 response, output_format, prefix=f"pose_{pose_key}", output_dir=char_dir,
             )
 
@@ -3049,7 +2073,7 @@ def generate_pose_sheet(
                     pose_image_map[pk] = first_img["path"]
                     pose_label_map[pk] = pr.get("label_ko", pk)
 
-        grid_path = _create_pose_grid_sheet(
+        grid_path = create_pose_grid_sheet(
             pose_images=pose_image_map,
             pose_labels=pose_label_map,
             character_name=character_name,
@@ -3059,87 +2083,104 @@ def generate_pose_sheet(
         if grid_path:
             final_result["pose_sheet"] = grid_path
 
-    return json.dumps(final_result, ensure_ascii=False, indent=2)
+    result_str = json.dumps(final_result, ensure_ascii=False, indent=2)
+    pose_count = final_result.get("summary", {}).get("completed", 0)
+    _report_telemetry(
+        server="terrychadesign", tool="generate_pose_sheet",
+        duration_ms=int((time.time() - start_time) * 1000),
+        input_summary={"character_name": character_name, "model": model, "size": image_size, "pose_count": len(pose_keys)},
+        output_summary={"poses_completed": pose_count, "poses_failed": final_result.get("summary", {}).get("failed", 0)},
+        estimated_cost_usd=0.02 * max(pose_count, 1),
+    )
+    return result_str
 
 
 @mcp.tool()
 def generate_chat_emoji(
-    reference_images: list[str],
     character_name: str,
-    expression_set: Optional[str] = None,
-    expressions: Optional[list[str]] = None,
-    platform: str = "universal",
-    style: Optional[str] = None,
+    expression_set: str = "basic_16",
+    concept: str = "",
+    special_count: int = 4,
+    custom_expressions: Optional[list[str]] = None,
+    reference_images: Optional[list[str]] = None,
     model: str = DEFAULT_MODEL,
-    image_size: str = "512px",
+    image_size: str = "2K",
+    grid_size: str = "2x2",
+    platform: str = "universal",
+    include_ico: bool = True,
+    style_hint: str = "",
+    output_format: str = "file",
     person_generation: Optional[str] = "ALLOW_ALL",
-    prominent_people: Optional[str] = None,
     temperature: Optional[float] = None,
     seed: Optional[int] = None,
     safety_level: Optional[str] = "BLOCK_NONE",
-    output_format: str = "file",
-    composite_sheet: bool = True,
     max_retries: int = DEFAULT_MAX_RETRIES,
     on_block: str = DEFAULT_ON_BLOCK,
 ) -> str:
-    """Generate SD/chibi character chat emoji stickers.
+    """Generate SD/chibi character chat emoji stickers via sheet-based pipeline.
 
     Creates cute super-deformed (SD) chibi emoji/stickers from character
-    references. Supports multiple messaging platforms with automatic
-    resizing and format conversion.
+    references using a grid sheet approach. Generates expressions as sheets,
+    splits into individual cells, removes chroma key background, and exports
+    platform-specific files.
 
-    The chibi transformation is applied automatically -- the character's
-    key features (hair, eyes, outfit) are preserved in a 2-3 head-to-body
-    ratio SD style with exaggerated expressions.
+    Supports 3-tier expression system:
+      - Base: from expression_set (e.g. "basic_16", "reaction_8", or combined "basic_16+reaction_8")
+      - Special: AI-generated from concept (e.g. "cat lover", "coffee addict")
+      - Custom: user-provided free-text expression descriptions
 
     Args:
-        reference_images: 1-3 reference image paths from design_character output.
-        character_name: Character name for folder naming.
-        expression_set: Predefined set key. "basic_16" (16 emojis) or
-                        "reaction_8" (8 emojis). Default: "basic_16".
-        expressions: Explicit list of expression keys to generate.
-                     Overrides expression_set. Cherry-pick across sets.
-                     Valid: "happy", "sad", "angry", "thumbs_up", etc.
-                     Use get_design_options() for full list.
-        platform: Target platform for output sizing and format.
+        character_name: Character name for folder naming and profile lookup.
+        expression_set: Predefined set key or '+'-combined sets.
+                        "basic_16" (16 emojis), "reaction_8" (8 emojis),
+                        "basic_16+reaction_8" (24 emojis). Default: "basic_16".
+        concept: Theme concept for AI-generated special expressions
+                 (e.g. "cat lover", "coffee addict"). Empty = skip specials.
+        special_count: Number of special expressions to generate. Default: 4.
+        custom_expressions: Free-text expression descriptions to add.
+        reference_images: 1-10 reference image paths. If not provided,
+                          loads from character profile via ProfileManager.
+        model: "flash" (default) or "pro".
+        image_size: Generation size for sheets. Default: "2K".
+        grid_size: Grid layout as "COLSxROWS" (e.g. "2x2", "3x3", "4x4"). Default: "2x2".
+        platform: Target platform for output sizing.
                   Valid: "telegram", "discord", "line", "kakaotalk",
                   "slack", "whatsapp", "universal". Default: "universal".
-        style: Optional original art style hint (e.g., "anime").
-               Chibi transformation is always applied regardless.
-        model: "flash" (default) or "pro".
-        image_size: Generation size. Default: "512px".
+        include_ico: Generate ICO files alongside platform PNGs. Default: True.
+        style_hint: Optional style hint for sheet prompt (e.g. "anime").
+        output_format: "file" (default) or "base64".
         person_generation: Default: "ALLOW_ALL".
-        prominent_people: "ALLOW" or "DENY" for celebrity generation.
         temperature: 0.0-2.0. Recommended: 0.5-0.8.
         seed: Fixed seed for reproducibility.
         safety_level: Safety filter threshold.
-        output_format: "file" (default) or "base64".
-        composite_sheet: Auto-generate preview grid. Default: True.
         max_retries: Max retry attempts on safety filter block. Default: 3.
         on_block: "retry" or "stop". Default: "retry".
 
     Returns:
-        JSON with per-emoji results, platform info, composite path, summary.
+        JSON with per-emoji results, platform info, sheet paths, DB set_id, summary.
     """
-    # Validate retry parameters
+    import math
+    start_time = time.time()
+
+    # --- Validate retry parameters ---
     if on_block not in VALID_ON_BLOCK:
         return json.dumps({"error": f"Invalid on_block: {on_block}. Valid: {sorted(VALID_ON_BLOCK)}"})
 
-    # Resolve model
+    # --- Resolve model ---
     try:
-        model_id = _resolve_model(model)
+        model_id = resolve_model(model, MODELS)
     except ValueError as e:
         return json.dumps({"error": str(e)})
 
-    # Validate platform
+    # --- Validate platform ---
     if platform not in EMOJI_PLATFORMS:
         return json.dumps({
             "error": f"Unknown platform '{platform}'. "
             f"Valid: {sorted(EMOJI_PLATFORMS.keys())}"
         })
 
-    # Validate parameters
-    errors = _validate_params(
+    # --- Validate parameters ---
+    errors = validate_params(
         model_key=model,
         aspect_ratio="1:1",
         image_size=image_size,
@@ -3147,47 +2188,48 @@ def generate_chat_emoji(
         person_generation=person_generation,
         safety_level=safety_level,
         temperature=temperature,
+        **_VALIDATE_KW,
     )
     if errors:
         return json.dumps({"errors": errors})
 
-    # Resolve selected expressions
-    selected_exprs = {}
-    if expressions:
-        # Cherry-pick across all sets
-        all_exprs = {}
-        for s in EMOJI_EXPRESSION_SETS.values():
-            all_exprs.update(s["expressions"])
-        for ek in expressions:
-            if ek not in all_exprs:
-                return json.dumps({
-                    "error": f"Unknown expression '{ek}'. "
-                    "Use get_design_options() for valid expressions."
-                })
-            selected_exprs[ek] = all_exprs[ek]
-    else:
-        set_key = expression_set or DEFAULT_EMOJI_SET
-        if set_key not in EMOJI_EXPRESSION_SETS:
-            return json.dumps({
-                "error": f"Unknown expression_set '{set_key}'. "
-                f"Valid: {sorted(EMOJI_EXPRESSION_SETS.keys())}"
-            })
-        selected_exprs = dict(EMOJI_EXPRESSION_SETS[set_key]["expressions"])
+    # --- Parse grid_size ---
+    try:
+        parts = grid_size.lower().split("x")
+        grid_cols = int(parts[0])
+        grid_rows = int(parts[1]) if len(parts) > 1 else grid_cols
+    except (ValueError, IndexError):
+        return json.dumps({"error": f"Invalid grid_size '{grid_size}'. Expected format: 'COLSxROWS' (e.g. '4x4')."})
+    grid_capacity = grid_cols * grid_rows
 
-    if not selected_exprs:
-        return json.dumps({"error": "No expressions selected."})
+    # --- Parse expression sets (supports '+' combos) ---
+    try:
+        base_exprs = _parse_expression_sets(expression_set)
+    except ValueError as e:
+        return json.dumps({"error": str(e)})
 
-    # Validate reference images
+    # --- Reference images: from param or profile ---
     if not reference_images:
-        return json.dumps({"error": "At least one reference image is required."})
+        try:
+            pm = _get_profile_manager()
+            profile = pm.get(character_name)
+            gen_defaults = profile.get("generation_defaults") or {}
+            reference_images = gen_defaults.get("reference_images") or []
+        except FileNotFoundError:
+            return json.dumps({
+                "error": f"No reference_images provided and profile '{character_name}' not found."
+            })
 
-    reference_images = _convert_nas_paths(reference_images)
+    if not reference_images:
+        return json.dumps({"error": "No reference images available (param or profile)."})
+
+    reference_images = convert_nas_paths(reference_images)
 
     max_refs = 10 if model.lower() == "flash" else 14
     if len(reference_images) > max_refs:
         reference_images = reference_images[:max_refs]
 
-    # Load reference images
+    # Load reference image bytes
     ref_parts = []
     for ref_path in reference_images:
         ref = Path(ref_path)
@@ -3198,103 +2240,346 @@ def generate_chat_emoji(
             types.Part.from_bytes(data=ref.read_bytes(), mime_type=mime_type)
         )
 
-    # Create output directory
-    char_dir = _ensure_design_dir(f"{character_name}_emoji")
+    # --- Generate special expressions (graceful failure) ---
+    special_exprs = []
+    if concept and special_count > 0:
+        try:
+            client = get_client(USE_VERTEX_AI, VERTEX_PROJECT, VERTEX_LOCATION)
+            # Build minimal profile dict for text generation
+            try:
+                pm = _get_profile_manager()
+                char_profile = pm.get(character_name)
+            except FileNotFoundError:
+                char_profile = {"name": character_name}
+            special_exprs = generate_special_expressions(
+                client, char_profile, concept, count=special_count,
+            )
+        except Exception:
+            # Skip specials on failure — base + custom still proceed
+            special_exprs = []
+
+    # --- Merge all tiers ---
+    merged = _merge_expressions(base_exprs, special_exprs, custom_expressions or [])
+    if not merged:
+        return json.dumps({"error": "No expressions to generate."})
+
+    # --- Partition into sheet batches ---
+    batches = []
+    for i in range(0, len(merged), grid_capacity):
+        batches.append(merged[i:i + grid_capacity])
+
+    # --- Check prompt length, fallback to 3x3 if needed ---
+    test_prompt = build_sheet_prompt(batches[0], grid_cols, style_hint)
+    if len(test_prompt) > SHEET_PROMPT_CHAR_LIMIT and grid_cols > 3:
+        grid_cols = 3
+        grid_rows = 3
+        grid_capacity = 9
+        # Re-partition
+        batches = []
+        for i in range(0, len(merged), grid_capacity):
+            batches.append(merged[i:i + grid_capacity])
+
+    # --- Create output directory structure ---
+    char_dir = ensure_design_dir(f"{character_name}_emoji", OUTPUT_DIR)
+    emoji_dir = char_dir / "emoji"
+    emoji_dir.mkdir(parents=True, exist_ok=True)
+    raw_sheets_dir = char_dir / "raw_sheets"
+    raw_sheets_dir.mkdir(parents=True, exist_ok=True)
+    platform_dir = char_dir / "platform" / platform
+    platform_dir.mkdir(parents=True, exist_ok=True)
+    if include_ico:
+        ico_dir = char_dir / "platform" / "ico"
+        ico_dir.mkdir(parents=True, exist_ok=True)
 
     platform_spec = EMOJI_PLATFORMS[platform]
+    client = get_client(USE_VERTEX_AI, VERTEX_PROJECT, VERTEX_LOCATION)
 
-    client = _get_client()
+    # --- DB: create emoji set ---
+    db = _get_design_db()
+    set_id = db.create_emoji_set(
+        character_name=character_name,
+        version="v1.0",
+        theme_tag=concept or None,
+        style="chibi_sd",
+        grid_size=grid_size,
+        total_count=len(merged),
+        sheet_count=len(batches),
+        base_set=expression_set,
+        special_count=len(special_exprs),
+        custom_count=len(custom_expressions or []),
+        reference_images=json.dumps([str(p) for p in reference_images]),
+        model=model_id,
+        image_size=image_size,
+        output_dir=str(char_dir),
+    )
+
     results = {}
-    raw_images = {}  # Store pre-chroma-key paths for grid sheet
+    raw_sheet_paths = []
+    global_idx = 0
 
-    expr_keys = list(selected_exprs.keys())
-    for i, expr_key in enumerate(expr_keys):
-        expr_def = selected_exprs[expr_key]
+    for sheet_num, batch in enumerate(batches, start=1):
+        # Build sheet prompt
+        sheet_prompt_text = build_sheet_prompt(batch, grid_cols, style_hint)
 
-        # Build emoji prompt with chibi + chroma key
-        emoji_prompt = EMOJI_CONSISTENCY_PREFIX + CHIBI_STYLE_PREFIX
-        if style:
-            emoji_prompt += f"{style} inspired color palette and aesthetics. "
-        emoji_prompt += f"{expr_def['prompt']}. "
-        emoji_prompt += f"{EMOJI_CHROMA_BG}. "
+        # Prepend consistency + chibi sheet + chroma key instructions
+        full_prompt = (
+            EMOJI_CONSISTENCY_PREFIX
+            + CHIBI_SHEET_STYLE_PREFIX
+            + f" {EMOJI_CHROMA_BG}. "
+            + sheet_prompt_text
+        )
 
         # Build content parts
-        content_parts = list(ref_parts) + [emoji_prompt]
+        content_parts = list(ref_parts) + [full_prompt]
 
-        # Build config (always 1:1 at 512px)
-        emoji_config = _build_config(
+        # Build config (always 1:1)
+        emoji_config = build_config(
             model_key=model,
             aspect_ratio="1:1",
             image_size=image_size,
             number_of_images=1,
             person_generation=person_generation,
-            prominent_people=prominent_people,
             temperature=temperature,
             seed=seed,
             safety_level=safety_level,
+            **_BUILD_CONFIG_KW,
         )
 
         try:
-            response = _generate_with_retry(
+            response = generate_with_retry(
                 client, model_id, content_parts, emoji_config,
                 max_retries=max_retries, on_block=on_block,
             )
 
-            extracted = _extract_results(
-                response, output_format,
-                prefix=f"emoji_{expr_key}", output_dir=char_dir,
+            # Extract raw sheet image
+            extracted = extract_results(
+                response, "file",
+                prefix=f"sheet_{sheet_num:02d}", output_dir=raw_sheets_dir,
             )
 
-            emoji_result = {
-                "status": "completed",
-                "expression_key": expr_key,
-                "label": expr_def["label"],
-                "label_ko": expr_def["label_ko"],
-            }
+            if not extracted["images"]:
+                # No image returned — mark entire batch as failed
+                for expr in batch:
+                    results[expr["key"]] = {
+                        "status": "failed",
+                        "expression_key": expr["key"],
+                        "label": expr["label"],
+                        "label_ko": expr.get("label_ko", ""),
+                        "error": "No image in sheet response",
+                    }
+                    global_idx += 1
+                continue
 
-            # Post-process: chroma key removal + platform resize
-            if output_format == "file" and extracted["images"]:
-                first_img = extracted["images"][0]
-                raw_path = first_img.get("path")
-                if raw_path:
-                    # Remove chroma key background
-                    rgba_img = _remove_chroma_key_background(raw_path)
+            raw_sheet_path = extracted["images"][0].get("path")
+            if not raw_sheet_path:
+                for expr in batch:
+                    results[expr["key"]] = {
+                        "status": "failed",
+                        "expression_key": expr["key"],
+                        "label": expr["label"],
+                        "label_ko": expr.get("label_ko", ""),
+                        "error": "No path in sheet response",
+                    }
+                    global_idx += 1
+                continue
 
-                    # Resize for target platform
-                    platform_path = _resize_for_platform(
-                        rgba_img, platform, char_dir, f"emoji_{expr_key}",
+            # Save raw sheet as PNG for chroma key fidelity
+            raw_png_path = save_image_png(
+                Path(raw_sheet_path).read_bytes(),
+                prefix=f"raw_sheet_{sheet_num:02d}",
+                output_dir=raw_sheets_dir,
+            )
+            raw_sheet_paths.append(raw_png_path)
+
+            # Split sheet: Vision AI analysis → coordinate-based crop → contour fallback
+            cells = []
+            try:
+                analysis_client = get_client(USE_VERTEX_AI, VERTEX_PROJECT, VERTEX_LOCATION)
+                analysis_model = resolve_model("flash", USE_VERTEX_AI)
+                layout = analyze_sheet_layout(analysis_client, analysis_model, raw_png_path)
+
+                if layout["emoji_count"] > 0:
+                    from PIL import Image as PILImage
+                    sheet_img = PILImage.open(raw_png_path).convert("RGB")
+                    for ebox in layout["emojis"]:
+                        x, y, w, h = ebox["x"], ebox["y"], ebox["width"], ebox["height"]
+                        # Inset 3% to trim outer edge artifacts (green outline residue)
+                        inset_x = int(w * 0.03)
+                        inset_y = int(h * 0.03)
+                        x0 = x + inset_x
+                        y0 = y + inset_y
+                        x1 = x + w - inset_x
+                        y1 = y + h - inset_y
+                        cell = sheet_img.crop((x0, y0, x1, y1)).convert("RGBA")
+                        cells.append(cell)
+                    logger.info(
+                        "Vision analysis detected %d emojis in sheet %d",
+                        len(cells), sheet_num,
                     )
+            except Exception as vision_err:
+                logger.warning("Vision sheet analysis failed: %s — trying contour", vision_err)
 
-                    raw_images[expr_key] = raw_path
-                    emoji_result["images"] = [{
-                        "format": "file",
-                        "path": platform_path,
-                        "mime_type": f"image/{platform_spec['format']}",
-                        "platform": platform,
-                        "size": f"{platform_spec['size'][0]}x{platform_spec['size'][1]}",
-                    }]
-                    emoji_result["raw_image"] = raw_path
-                else:
-                    emoji_result.update(extracted)
-            else:
-                emoji_result.update(extracted)
+            # Fallback to contour detection if vision found nothing
+            if not cells:
+                cells = split_sheet_by_contour(
+                    raw_png_path,
+                    expected_count=len(batch),
+                    cols=grid_cols,
+                )
 
-            results[expr_key] = emoji_result
+            # Process each cell
+            for cell_idx, expr in enumerate(batch):
+                if cell_idx >= len(cells):
+                    results[expr["key"]] = {
+                        "status": "failed",
+                        "expression_key": expr["key"],
+                        "label": expr["label"],
+                        "label_ko": expr.get("label_ko", ""),
+                        "error": f"Cell {cell_idx} not found in split (got {len(cells)} cells)",
+                    }
+                    global_idx += 1
+                    continue
+
+                cell_img = cells[cell_idx]
+
+                # Save individual emoji (before chroma removal, for raw reference)
+                emoji_filename = f"{expr['key']}--{global_idx:02d}.png"
+                emoji_path = emoji_dir / emoji_filename
+                cell_img.save(str(emoji_path), "PNG")
+
+                # Remove chroma key background
+                rgba_img = remove_chroma_key_background(str(emoji_path))
+
+                # Overwrite with transparent version
+                rgba_img.save(str(emoji_path), "PNG")
+
+                # --- QC (Quality Check) via Vision ---
+                qc_result = {"score": 5, "pass": True, "issues": []}
+                try:
+                    qc_client = get_client(USE_VERTEX_AI, VERTEX_PROJECT, VERTEX_LOCATION)
+                    qc_model = resolve_model("flash", USE_VERTEX_AI)
+                    qc_result = qc_emoji(qc_client, qc_model, str(emoji_path), expr["key"])
+                except Exception as qc_err:
+                    logger.warning("QC check failed for %s: %s", expr["key"], qc_err)
+
+                # If QC fails, attempt individual regen once
+                if not qc_result["pass"]:
+                    logger.info(
+                        "QC failed for %s (score=%d, issues=%s) — attempting regen",
+                        expr["key"], qc_result["score"], qc_result["issues"],
+                    )
+                    try:
+                        regen_prompt = (
+                            EMOJI_CONSISTENCY_PREFIX
+                            + CHIBI_STYLE_PREFIX
+                            + f"\nDraw a single chibi character emoji: {expr['label']} ({expr['key']}). "
+                            f"{expr.get('prompt', '')} "
+                            f"Bright green (#00FF00) solid background for chroma key removal.\n"
+                        )
+                        regen_contents = ref_parts + [regen_prompt]
+                        regen_config = build_config(
+                            image_size=image_size,
+                            person_generation=person_generation,
+                            temperature=temperature,
+                            seed=seed,
+                            safety_level=safety_level,
+                        )
+                        regen_response = generate_with_retry(
+                            qc_client, model_id, regen_contents, regen_config,
+                            max_retries=1, on_block="stop",
+                        )
+                        regen_results = extract_results(regen_response)
+                        if regen_results:
+                            regen_img = regen_results[0]
+                            regen_img.save(str(emoji_path), "PNG")
+                            rgba_img = remove_chroma_key_background(str(emoji_path))
+                            rgba_img.save(str(emoji_path), "PNG")
+                            # Re-run QC on regen
+                            qc_result = qc_emoji(qc_client, qc_model, str(emoji_path), expr["key"])
+                            logger.info("Regen QC for %s: score=%d", expr["key"], qc_result["score"])
+                    except Exception as regen_err:
+                        logger.warning("Regen failed for %s: %s", expr["key"], regen_err)
+
+                # Resize for target platform
+                platform_path = resize_for_platform(
+                    rgba_img, platform, platform_dir, f"{expr['key']}--{global_idx:02d}",
+                )
+
+                # Export ICO if requested
+                ico_path = None
+                if include_ico:
+                    ico_filename = f"{expr['key']}--{global_idx:02d}.ico"
+                    ico_path = export_ico(rgba_img, str(ico_dir / ico_filename))
+
+                # Build platform files dict for DB
+                platforms_dict = {
+                    platform: platform_path,
+                }
+                if ico_path:
+                    platforms_dict["ico"] = ico_path
+
+                # Build QC notes for DB
+                qc_notes = ""
+                if qc_result.get("issues"):
+                    qc_notes = f"QC score: {qc_result['score']}/5. Issues: {', '.join(qc_result['issues'])}"
+
+                # Record to DB (with QC rating and notes)
+                db.add_emoji_item(
+                    set_id,
+                    grid_index=global_idx,
+                    sheet_number=sheet_num,
+                    key=expr["key"],
+                    label=expr["label"],
+                    label_ko=expr.get("label_ko", ""),
+                    category=expr.get("category", "base"),
+                    prompt=expr.get("prompt", ""),
+                    file_path=str(emoji_path),
+                    platforms=json.dumps(platforms_dict),
+                    status="ok",
+                    rating=qc_result.get("score"),
+                    notes=qc_notes if qc_notes else None,
+                )
+
+                results[expr["key"]] = {
+                    "status": "completed",
+                    "expression_key": expr["key"],
+                    "label": expr["label"],
+                    "label_ko": expr.get("label_ko", ""),
+                    "category": expr.get("category", "base"),
+                    "emoji_path": str(emoji_path),
+                    "platform_path": platform_path,
+                    "ico_path": ico_path,
+                    "sheet_number": sheet_num,
+                    "grid_index": global_idx,
+                    "qc_score": qc_result.get("score"),
+                    "qc_pass": qc_result.get("pass"),
+                    "qc_issues": qc_result.get("issues", []),
+                }
+                global_idx += 1
 
         except Exception as e:
-            results[expr_key] = {
-                "status": "failed",
-                "expression_key": expr_key,
-                "label": expr_def["label"],
-                "label_ko": expr_def["label_ko"],
-                "error": str(e),
-            }
+            for expr in batch:
+                results[expr["key"]] = {
+                    "status": "failed",
+                    "expression_key": expr["key"],
+                    "label": expr["label"],
+                    "label_ko": expr.get("label_ko", ""),
+                    "error": str(e),
+                }
+                global_idx += 1
 
-        # Rate limit delay
-        if i < len(expr_keys) - 1:
+        # Rate limit delay between sheets
+        if sheet_num < len(batches):
             time.sleep(INTER_SHOT_DELAY)
 
-    # Summary
+    # --- Export manifest ---
+    manifest_path = None
+    try:
+        manifest_path = db.export_manifest(set_id, str(char_dir))
+    except Exception:
+        pass  # Non-fatal
+
+    # --- Summary ---
     completed = sum(1 for r in results.values() if r["status"] == "completed")
     failed = sum(1 for r in results.values() if r["status"] == "failed")
 
@@ -3302,6 +2587,7 @@ def generate_chat_emoji(
         "character_name": character_name,
         "output_dir": str(char_dir),
         "model": model_id,
+        "db_set_id": set_id,
         "platform": {
             "key": platform,
             "label": platform_spec["label"],
@@ -3309,38 +2595,46 @@ def generate_chat_emoji(
             "format": platform_spec["format"],
         },
         "summary": {
-            "total_emojis": len(expr_keys),
+            "total_emojis": len(merged),
+            "sheets_generated": len(raw_sheet_paths),
             "completed": completed,
             "failed": failed,
+            "base_count": sum(1 for e in merged if e.get("category") == "base"),
+            "special_count": sum(1 for e in merged if e.get("category") == "special"),
+            "custom_count": sum(1 for e in merged if e.get("category") == "custom"),
         },
         "settings": {
             "image_size": image_size,
+            "grid_size": f"{grid_cols}x{grid_rows}",
             "person_generation": person_generation,
+            "expression_set": expression_set,
+            "concept": concept,
+            "include_ico": include_ico,
         },
+        "raw_sheets": raw_sheet_paths,
         "expressions": results,
     }
-    if style:
-        final_result["style"] = style
+    if style_hint:
+        final_result["style_hint"] = style_hint
     if seed is not None:
         final_result["settings"]["seed"] = seed
     if temperature is not None:
         final_result["settings"]["temperature"] = temperature
+    if manifest_path:
+        final_result["manifest_path"] = manifest_path
 
-    # Auto-generate composite preview grid
-    if composite_sheet and output_format == "file" and completed >= 2:
+    # --- Preview grid ---
+    if output_format == "file" and completed >= 2:
         emoji_image_map = {}
         emoji_label_map = {}
         for ek, er in results.items():
             if er.get("status") == "completed":
-                # Use raw image (before chroma key) for more readable preview
-                raw = er.get("raw_image") or (
-                    er.get("images", [{}])[0].get("path") if er.get("images") else None
-                )
-                if raw:
-                    emoji_image_map[ek] = raw
+                path = er.get("emoji_path")
+                if path:
+                    emoji_image_map[ek] = path
                     emoji_label_map[ek] = er.get("label_ko", ek)
 
-        grid_path = _create_emoji_grid_sheet(
+        grid_path = create_emoji_grid_sheet(
             emoji_images=emoji_image_map,
             emoji_labels=emoji_label_map,
             character_name=character_name,
@@ -3350,7 +2644,138 @@ def generate_chat_emoji(
         if grid_path:
             final_result["emoji_preview_sheet"] = grid_path
 
-    return json.dumps(final_result, ensure_ascii=False, indent=2)
+    result_str = json.dumps(final_result, ensure_ascii=False, indent=2)
+    sheet_count = final_result.get("summary", {}).get("sheets_generated", 0)
+    _report_telemetry(
+        server="terrychadesign", tool="generate_chat_emoji",
+        duration_ms=int((time.time() - start_time) * 1000),
+        input_summary={"character_name": character_name, "model": model, "size": image_size, "expression_set": expression_set, "grid_size": grid_size},
+        output_summary={"sheets_generated": sheet_count, "emojis_completed": final_result.get("summary", {}).get("completed", 0), "emojis_failed": final_result.get("summary", {}).get("failed", 0)},
+        estimated_cost_usd=0.02 * max(sheet_count, 1),
+    )
+    return result_str
+
+
+@mcp.tool()
+def generate_animated_emoji(
+    character_name: str,
+    emoji_keys: list[str],
+    frame_delay_ms: int = 200,
+    loop: int = 0,
+    mode: str = "sequential",
+    set_id: Optional[int] = None,
+    output_format: str = "all",
+) -> str:
+    """Generate animated GIF/WebP from existing emoji in the database.
+
+    Combines individual emoji images into frame-based animations.
+    No additional Gemini API calls required.
+
+    Args:
+        character_name: Character name to pull emoji from.
+        emoji_keys: Ordered list of expression keys for frames (min 2).
+        frame_delay_ms: Milliseconds per frame (50-2000). Default: 200.
+        loop: 0 = infinite loop, N = loop N times.
+        mode: "sequential" or "bounce". Bounce plays 1->2->3->2->1.
+        set_id: Specific emoji set ID (None = search latest).
+        output_format: "gif", "webp", or "all" (both).
+
+    Returns:
+        JSON with animation paths and metadata.
+    """
+    # Validate inputs
+    if len(emoji_keys) < 2:
+        raise ValueError("Need at least 2 frames (emoji_keys) for animation")
+    if mode not in ("sequential", "bounce"):
+        raise ValueError(f"Invalid mode '{mode}'. Use 'sequential' or 'bounce'")
+    if frame_delay_ms < 50 or frame_delay_ms > 2000:
+        raise ValueError("frame_delay_ms must be 50-2000")
+    if output_format not in ("gif", "webp", "all"):
+        raise ValueError(f"Invalid output_format '{output_format}'. Use 'gif', 'webp', or 'all'")
+
+    db = _get_design_db()
+
+    # Load frames from DB
+    frames = []
+    for key in emoji_keys:
+        results = db.find_emoji(character_name, key)
+        if set_id is not None:
+            results = [r for r in results if r.get("set_id") == set_id]
+        if not results:
+            raise ValueError(f"Emoji '{key}' not found for character '{character_name}'")
+        emoji_item = results[-1]  # Most recent match
+        # Resolve file path
+        emoji_path = emoji_item["file_path"]
+        if not Path(emoji_path).is_absolute():
+            emoji_set = db.get_emoji_set(emoji_item["set_id"])
+            if emoji_set:
+                emoji_path = str(Path(emoji_set["output_dir"]) / emoji_path)
+        emoji_path = convert_nas_path(emoji_path)
+        img = Image.open(emoji_path).convert("RGBA")
+        frames.append(img)
+
+    # Ensure all frames are the same size as the first frame
+    target_size = frames[0].size
+    frames = [
+        f.resize(target_size, Image.LANCZOS) if f.size != target_size else f
+        for f in frames
+    ]
+
+    # Create output directory under character's animated subfolder
+    char_dir = ensure_design_dir(f"{character_name}_animated", OUTPUT_DIR)
+    anim_dir = Path(char_dir)
+
+    # Build animation name from emoji keys (max 5 shown, rest summarized)
+    anim_name = "-".join(emoji_keys[:5])
+    if len(emoji_keys) > 5:
+        anim_name += f"-plus{len(emoji_keys) - 5}"
+
+    result_paths = {}
+
+    if output_format in ("gif", "all"):
+        # Universal 512x512
+        gif_512 = str(anim_dir / f"{anim_name}_512.gif")
+        resized_512 = [f.resize((512, 512), Image.LANCZOS) for f in frames]
+        create_animated_gif(resized_512, gif_512, delay_ms=frame_delay_ms, loop=loop, mode=mode)
+        result_paths["gif_512"] = gif_512
+        # Discord 128x128
+        gif_128 = str(anim_dir / f"{anim_name}_128.gif")
+        small = [f.resize((128, 128), Image.LANCZOS) for f in frames]
+        create_animated_gif(small, gif_128, delay_ms=frame_delay_ms, loop=loop, mode=mode)
+        result_paths["gif_discord"] = gif_128
+
+    if output_format in ("webp", "all"):
+        webp_path = str(anim_dir / f"{anim_name}_512.webp")
+        resized_512_webp = [f.resize((512, 512), Image.LANCZOS) for f in frames]
+        create_animated_webp(resized_512_webp, webp_path, delay_ms=frame_delay_ms, loop=loop, mode=mode)
+        result_paths["webp_512"] = webp_path
+
+    # Record animation to DB
+    anim_id = db.create_animation(
+        character_name=character_name,
+        set_id=set_id,
+        name=anim_name,
+        emoji_keys=emoji_keys,
+        mode=mode,
+        frame_delay_ms=frame_delay_ms,
+        loop_count=loop,
+        gif_path=result_paths.get("gif_512"),
+        webp_path=result_paths.get("webp_512"),
+        gif_discord_path=result_paths.get("gif_discord"),
+        frame_count=len(emoji_keys),
+    )
+
+    return json.dumps({
+        "animation_id": anim_id,
+        "character_name": character_name,
+        "name": anim_name,
+        "mode": mode,
+        "frame_count": len(emoji_keys),
+        "emoji_keys": emoji_keys,
+        "frame_delay_ms": frame_delay_ms,
+        "paths": result_paths,
+        "output_dir": str(anim_dir),
+    }, indent=2)
 
 
 @mcp.tool()
@@ -3449,14 +2874,19 @@ def estimate_generation_cost(
                 return json.dumps({"error": f"No valid categories found. Valid: {sorted(POSE_CATEGORIES.keys())}"})
 
     elif tool == "generate_chat_emoji":
+        _EMOJI_SHEET_GRID_CAPACITY = 16  # 4x4 default sheet
         if expressions:
-            image_count = len(expressions)
-            breakdown["custom_expressions"] = len(expressions)
+            expr_count = len(expressions)
+            image_count = math.ceil(expr_count / _EMOJI_SHEET_GRID_CAPACITY)
+            breakdown["custom_expressions"] = expr_count
+            breakdown["sheet_count"] = image_count
         else:
             set_key = expression_set or DEFAULT_EMOJI_SET
             if set_key in EMOJI_EXPRESSION_SETS:
-                image_count = len(EMOJI_EXPRESSION_SETS[set_key]["expressions"])
-                breakdown[set_key] = image_count
+                expr_count = len(EMOJI_EXPRESSION_SETS[set_key]["expressions"])
+                image_count = math.ceil(expr_count / _EMOJI_SHEET_GRID_CAPACITY)
+                breakdown[set_key] = expr_count
+                breakdown["sheet_count"] = image_count
             else:
                 return json.dumps({
                     "error": f"Unknown expression_set '{set_key}'. "
@@ -3888,10 +3318,7 @@ def suggest_outfits(
         profile: Character profile name (e.g., "siwol", "claudie").
         concept: Styling concept - one of: casual, street, formal, sporty, date, minimal, cozy.
     """
-    import sqlite3
-    import random
-
-    VALID_CONCEPTS = {"casual", "street", "formal", "sporty", "date", "minimal", "cozy"}
+    VALID_CONCEPTS = set(CONCEPT_CATEGORIES.keys())
     if concept not in VALID_CONCEPTS:
         return json.dumps({"error": f"Invalid concept '{concept}'. Valid: {sorted(VALID_CONCEPTS)}"})
 
@@ -3902,90 +3329,19 @@ def suggest_outfits(
     except FileNotFoundError as e:
         return json.dumps({"error": str(e)})
 
-    style_prefs = prof.get("style_preferences", {})
-    theme_colors = style_prefs.get("theme_colors", [])
-    brand_vibe = style_prefs.get("brand_vibe", [])
+    brand_vibe = prof.get("style_preferences", {}).get("brand_vibe", [])
 
-    # Connect to catalog.db (env var > platform default)
-    db_path = os.environ.get("PRODUCT_CATALOG_DB")
-    if not db_path:
-        # Auto-detect platform default
-        _catalog_defaults = [
-            _NAS_PATH_MAP["macos"] + "Claudie/product_catalog/catalog.db",
-            _NAS_PATH_MAP["windows"] + "Claudie/product_catalog/catalog.db",
-            _NAS_PATH_MAP["unc"] + "Claudie/product_catalog/catalog.db",
-        ]
-        for candidate in _catalog_defaults:
-            if Path(candidate).exists():
-                db_path = candidate
-                break
-    if not db_path or not Path(db_path).exists():
-        return json.dumps({"error": f"Product catalog database not found. Set PRODUCT_CATALOG_DB environment variable. Searched: {_catalog_defaults if not db_path else db_path}"})
+    try:
+        db_path = get_catalog_db_path()
+    except FileNotFoundError as e:
+        return json.dumps({"error": str(e)})
 
-    conn = sqlite3.connect(db_path)
-    conn.row_factory = sqlite3.Row
+    proposals = suggest_outfit_items(db_path, concept, brand_vibe=brand_vibe)
 
-    # Category slots for outfit assembly
-    CONCEPT_CATEGORIES = {
-        "casual": ["top", "bottom", "shoes"],
-        "street": ["top", "bottom", "outer", "shoes"],
-        "formal": ["top", "bottom", "shoes", "accessory"],
-        "sporty": ["top", "bottom", "shoes"],
-        "date": ["top", "bottom", "shoes", "accessory"],
-        "minimal": ["top", "bottom", "shoes"],
-        "cozy": ["top", "outer", "bottom", "shoes"],
-    }
-
-    categories = CONCEPT_CATEGORIES.get(concept, ["top", "bottom", "shoes"])
-
-    # Query products per category
-    proposals = []
-
-    for option_idx, option_label in enumerate(["A", "B", "C"]):
-        items = []
-        for cat in categories:
-            # Build query with brand affinity
-            query = "SELECT product_id, brand, name, price, colors, materials, local_image_path FROM products WHERE 1=1"
-            params = []
-
-            # Category filter (exact match on category field)
-            query += " AND category = ?"
-            params.append(cat)
-
-            # Brand affinity (prefer profile brands but don't require)
-            if brand_vibe:
-                brand_clause = " OR ".join(["brand LIKE ?" for _ in brand_vibe])
-                query += f" AND ({brand_clause} OR 1=1)"
-                params.extend([f"%{b}%" for b in brand_vibe])
-
-            query += " ORDER BY RANDOM() LIMIT 5"
-
-            try:
-                cursor = conn.execute(query, params)
-                rows = cursor.fetchall()
-                if rows:
-                    # Pick one (with some randomness per proposal)
-                    row = rows[min(option_idx, len(rows) - 1)]
-                    items.append({
-                        "product_id": row["product_id"],
-                        "brand": row["brand"],
-                        "name": row["name"],
-                        "category": cat,
-                        "price": str(row["price"]) if row["price"] else "",
-                        "color": row["colors"] if row["colors"] else "",
-                    })
-            except Exception:
-                continue
-
-        if len(items) >= 2:  # minimum: top + bottom
-            proposals.append({
-                "option": option_label,
-                "description": f"{concept.capitalize()} look for {profile}",
-                "items": items,
-                "rationale": f"Matches {profile}'s style preferences with {concept} concept",
-            })
-
-    conn.close()
+    # Enrich descriptions with profile name
+    for p in proposals:
+        p["description"] = f"{concept.capitalize()} look for {profile}"
+        p["rationale"] = f"Matches {profile}'s style preferences with {concept} concept"
 
     return json.dumps({
         "character": profile,
@@ -4023,11 +3379,9 @@ def try_on_product(
         model: Generation model (flash or pro).
         image_size: Image size.
     """
-    import sqlite3
-
     # Resolve product input
     try:
-        input_type, input_value = _resolve_product_input(product_ids, product_id, product_query)
+        _resolve_product_input(product_ids, product_id, product_query)
     except ValueError as e:
         return json.dumps({"error": str(e)})
 
@@ -4038,42 +3392,19 @@ def try_on_product(
     except FileNotFoundError as e:
         return json.dumps({"error": str(e)})
 
-    # Connect to catalog.db
-    db_path = os.environ.get("PRODUCT_CATALOG_DB")
-    if not db_path or not Path(db_path).exists():
-        return json.dumps({"error": "Product catalog database not found. Set PRODUCT_CATALOG_DB environment variable."})
+    # Fetch products from catalog
+    try:
+        db_path = get_catalog_db_path()
+    except FileNotFoundError as e:
+        return json.dumps({"error": str(e)})
 
-    conn = sqlite3.connect(db_path)
-    conn.row_factory = sqlite3.Row
+    products = fetch_products(db_path, product_ids=product_ids, product_id=product_id, product_query=product_query)
 
-    # Resolve products
-    products = []
     reference_product_images = []
-
-    if input_type == "product_ids":
-        for pid in input_value:
-            row = conn.execute("SELECT * FROM products WHERE product_id = ?", (pid,)).fetchone()
-            if row:
-                products.append(dict(row))
-                if row["local_image_path"] and Path(row["local_image_path"]).exists():
-                    reference_product_images.append(row["local_image_path"])
-    elif input_type == "product_id":
-        row = conn.execute("SELECT * FROM products WHERE product_id = ?", (input_value,)).fetchone()
-        if row:
-            products.append(dict(row))
-            if row["local_image_path"] and Path(row["local_image_path"]).exists():
-                reference_product_images.append(row["local_image_path"])
-    elif input_type == "product_query":
-        rows = conn.execute(
-            "SELECT * FROM products WHERE name LIKE ? OR brand LIKE ? LIMIT 1",
-            (f"%{input_value}%", f"%{input_value}%")
-        ).fetchall()
-        for row in rows:
-            products.append(dict(row))
-            if row["local_image_path"] and Path(row["local_image_path"]).exists():
-                reference_product_images.append(row["local_image_path"])
-
-    conn.close()
+    for p in products:
+        lip = p.get("local_image_path")
+        if lip and Path(lip).exists():
+            reference_product_images.append(lip)
 
     if not products:
         return json.dumps({"error": "No products found matching the selection criteria."})

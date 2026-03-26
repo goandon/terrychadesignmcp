@@ -2,8 +2,31 @@
 
 An MCP server that generates consistent character reference image sets using Google's Nano Banana models (Vertex AI). Designed for maintaining visual consistency across video/image production pipelines.
 
-## What's New in v0.4.0
+## Results
 
+| Profile-driven | Product try-on | Emoji stickers |
+|:---:|:---:|:---:|
+| Consistent character across angles | Real products from catalog | Platform-ready SD/chibi |
+| `design_character(profile="siwol")` | `suggest_outfits` → `try_on_product` | `generate_chat_emoji` |
+
+**Profile consistency** — same character, different angles and outfits, maintained by anchor-based generation + YAML profiles.
+
+**Catalog integration** — suggest outfits from 2,698 real products (무신사), generate try-on images with product metadata.
+
+## What's New in v0.5.0
+
+- **SD emoji sheet system**: `generate_chat_emoji` now generates a full 4x4 (or 3x3 fallback) sprite sheet in a single API call instead of one-per-emoji
+- **3-tier expression system**: Combine `expression_set` presets + `special_count` extras + `custom_expressions` overrides
+- **Combo sets**: Use `+` notation (e.g. `"basic_16+reaction_8"`) to merge expression sets
+- **7-platform exports**: Per-platform export of individual emoji from the sheet (Telegram, Discord, LINE, KakaoTalk, Slack, WhatsApp, Universal) + optional ICO format
+- **Animated emoji**: New `generate_animated_emoji` tool creates GIF and animated WebP from existing emoji in the DB — no API calls needed
+- **DB tracking**: `emoji_sets` and `emoji_items` tables for full history of emoji generations
+- **emoji_dictionary.md**: Curated reference for all built-in expression sets and their SD art prompts
+- **21 total tools** (up from 19 in v0.4.1)
+
+## What's New in v0.4.1
+
+- **Modular architecture**: Server split into 4 focused modules (server.py, image_io.py, generation.py, catalog.py)
 - **Output modes**: `basic` (3-shot) and `face_angles` (3-shot) presets for faster generation
 - **Camera presets**: Photorealistic (portrait, fashion, street, editorial, selfie) and animation (anime_standard, anime_dramatic, chibi, game_art, webtoon) presets
 - **Character profiles**: YAML-based IP management with 5 CRUD tools and built-in Siwol/Claudie profiles
@@ -25,7 +48,9 @@ An MCP server that generates consistent character reference image sets using Goo
 - **Multiple art styles**: Anime, realistic, 3D render, watercolor, concept art, and more
 - **Additional poses**: Generate custom poses/scenes using existing character references
 - **Pose sample sheet**: Pre-defined pose categories (daily life, action, emotion, social) with auto grid composite
-- **SD chat emoji**: Generate chibi/SD character emoji stickers for Telegram, Discord, LINE, KakaoTalk, Slack, WhatsApp
+- **SD emoji sheet system**: Sheet-based emoji generation (4x4 grid, 3x3 fallback) with 3-tier expression system and 7-platform export
+- **Animated emoji**: GIF + animated WebP from existing emoji — no API calls, instant from DB
+- **Emoji DB**: Full tracking of emoji sets and individual items with manifest.json
 - **Prompt dictionary**: Curated reference vocabulary for character design prompts (13 categories)
 - **Clean image output**: Anti-overlay prompting prevents text labels, color swatches, and annotation insets
 - **Safety filter retry**: Automatic retry with softened prompts when safety filters block generation
@@ -88,7 +113,7 @@ pip install -r requirements.txt
 
 Set `GOOGLE_GENAI_USE_VERTEXAI=false` and provide `GEMINI_API_KEY` instead.
 
-## Tools (19 total)
+## Tools (21 total)
 
 ### `design_character`
 
@@ -237,7 +262,9 @@ generate_pose_sheet(
 
 ### `generate_chat_emoji`
 
-Generate SD/chibi character chat emoji stickers with platform-specific output.
+Generate SD/chibi character chat emoji stickers using a sheet-based pipeline. Generates a full 4x4 sprite sheet in a single API call, then slices it into individual emoji and exports to platform-specific formats.
+
+See [emoji_dictionary.md](emoji_dictionary.md) for the full list of built-in expressions and their SD art prompts.
 
 **Core inputs:**
 | Parameter | Type | Required | Description |
@@ -245,11 +272,12 @@ Generate SD/chibi character chat emoji stickers with platform-specific output.
 | `reference_images` | list | Yes | 1-3 reference image paths from `design_character` output |
 | `character_name` | str | Yes | Character name for folder naming |
 
-**Expression selection:**
-| Parameter | Type | Description |
-|-----------|------|-------------|
-| `expression_set` | str | `"basic_16"` (default) or `"reaction_8"` |
-| `expressions` | list | Cherry-pick individual expressions (overrides set) |
+**Expression selection (3-tier system):**
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `expression_set` | str | `"basic_16"` | Built-in set key, or `+` combo (e.g. `"basic_16+reaction_8"`). See emoji_dictionary.md |
+| `special_count` | int | `0` | Number of random "special" expressions to append |
+| `custom_expressions` | list | `[]` | Override or extend with custom expression strings |
 
 **Expression Sets:**
 | Set | Count | Expressions |
@@ -257,7 +285,21 @@ Generate SD/chibi character chat emoji stickers with platform-specific output.
 | `basic_16` | 16 | happy, sad, angry, surprised, love, thumbs_up, thinking, sleeping, crying, laughing, wink, embarrassed, cool, confused, excited, tired |
 | `reaction_8` | 8 | ok, no, please, cheers, sorry, thank_you, fighting, heart |
 
-**Platform options:**
+Use `+` to combine sets: `"basic_16+reaction_8"` → 24 expressions (generates multiple sheets).
+
+**Sheet generation:**
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `grid_size` | str | `"4x4"` | Sheet grid layout: `"4x4"` (16 per sheet) or `"3x3"` (9 per sheet, fallback) |
+| `concept` | str | None | Concept name for DB tracking |
+
+**Platform export:**
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `platforms` | list | all | List of platforms to export. Options: `telegram`, `discord`, `line`, `kakaotalk`, `slack`, `whatsapp`, `universal` |
+| `include_ico` | bool | False | Also export Windows ICO format (multi-size: 16, 32, 48, 64px) |
+
+**Platform sizes:**
 | Platform | Size | Format | Max Size |
 |----------|------|--------|----------|
 | `telegram` | 512x512 | PNG | 512 KB |
@@ -268,6 +310,12 @@ Generate SD/chibi character chat emoji stickers with platform-specific output.
 | `whatsapp` | 512x512 | WebP | 100 KB |
 | `universal` | 512x512 | PNG | None |
 
+**Output:**
+- Raw emoji sheets (PNG, 4x4 or 3x3 grid)
+- Individual emoji (sliced from sheet, per platform folder)
+- `manifest.json` — metadata for all emoji in the set
+- DB entries in `emoji_sets` + `emoji_items` tables
+
 **Example:**
 ```
 generate_chat_emoji(
@@ -276,11 +324,52 @@ generate_chat_emoji(
         "/path/to/Luna_20260302/face_front_....jpg"
     ],
     character_name="Luna",
-    expression_set="basic_16",
-    platform="telegram",
+    expression_set="basic_16+reaction_8",
+    special_count=2,
+    grid_size="4x4",
+    platforms=["telegram", "discord"],
+    include_ico=True,
+    concept="spring_emoji_set",
     style="anime",
     temperature=0.6,
     seed=42
+)
+```
+
+### `generate_animated_emoji`
+
+Create animated GIF and WebP files from existing emoji in the DB. No API calls are made — uses already-generated emoji images.
+
+**Core inputs:**
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `emoji_keys` | list | Yes | List of expression keys to animate (e.g. `["happy", "wink", "love"]`) |
+| `character_name` | str | Yes | Character name (used to look up emoji from DB) |
+
+**Animation options:**
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `frame_delay_ms` | int | `200` | Delay between frames in milliseconds |
+| `mode` | str | `"sequential"` | `"sequential"` (forward loop) or `"bounce"` (forward + reverse) |
+| `output_format` | str | `"all"` | `"gif"`, `"webp"`, or `"all"` |
+
+**Output:**
+| File | Size | Format | Use |
+|------|------|--------|-----|
+| `animated_<name>_512.gif` | 512x512 | GIF | Universal (Telegram, LINE, KakaoTalk) |
+| `animated_<name>_128.gif` | 128x128 | GIF | Discord |
+| `animated_<name>_512.webp` | 512x512 | Animated WebP | Telegram stickers |
+
+DB entry added to `emoji_animations` table.
+
+**Example:**
+```
+generate_animated_emoji(
+    emoji_keys=["happy", "wink", "excited", "love"],
+    character_name="Luna",
+    frame_delay_ms=150,
+    mode="bounce",
+    output_format="all"
 )
 ```
 
@@ -467,50 +556,46 @@ Requires a product catalog SQLite database (set via `PRODUCT_CATALOG_DB` env var
 
 ### `suggest_outfits`
 
-Propose 3 outfit combinations from the catalog based on style direction and character profile.
+Suggest 3 coordinated outfits based on character profile and styling concept.
 
-| Parameter | Type | Description |
-|-----------|------|-------------|
-| `style_direction` | str | Styling direction (e.g. "casual summer", "office chic") |
-| `character_name` | str | Character name for context |
-| `profile` | str | Character profile to match styling to |
-| `product_ids` | list | Pre-select specific product IDs |
-| `product_query` | str | Free-text search across catalog |
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `profile` | str | Yes | Character profile name (e.g., "siwol", "claudie") |
+| `concept` | str | Yes | Styling concept: casual, street, formal, sporty, date, minimal, cozy |
 
 **Example:**
 ```
-suggest_outfits(
-    style_direction="casual summer street style",
-    character_name="Siwol",
-    profile="siwol"
-)
-# Returns: 3 outfit proposals with product IDs, names, and descriptions
+suggest_outfits(profile="siwol", concept="street")
+# Returns: 3 outfit proposals (A/B/C) with product_id, brand, name, price per item
 ```
 
 ### `try_on_product`
 
-Generate a character image wearing a specific product from the catalog using reference images.
+Generate character wearing real products from catalog.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `character_name` | str | Yes | Character name |
-| `reference_images` | list | Yes | Character reference images |
-| `product_id` | str | Yes* | Product ID from catalog |
-| `product_ids` | list | No | Multiple products for an outfit |
-| `product_query` | str | No | Text search to auto-select product |
-| `style` | str | No | Override art style |
-| `camera_preset` | str | No | Camera/style preset |
-| `concept` | str | No | Concept name for history tracking |
+| `profile` | str | Yes | Character profile name |
+| `product_id` | str | No* | Single product ID |
+| `product_ids` | list | No* | Multiple product IDs for full outfit |
+| `product_query` | str | No* | Natural language search |
+| `camera_preset` | str | No | Camera preset (default: fashion) |
+| `output_mode` | str | No | Output mode (default: basic) |
+| `background` | str | No | Custom background description |
+| `pose` | str | No | Pose description |
+| `concept` | str | No | Concept name for history |
 
 *At least one of `product_id`, `product_ids`, or `product_query` is required.
 
-**Example:**
+**Example (from suggest_outfits pipeline):**
 ```
 try_on_product(
-    character_name="Siwol",
-    reference_images=["/path/to/Siwol_20260316/face_front_....jpg"],
-    product_id="MUS-12345",
-    camera_preset="street"
+    profile="siwol",
+    product_ids=["musinsa_5859187", "musinsa_6051110", "musinsa_6013524"],
+    camera_preset="street",
+    pose="walking confidently, one hand in jacket pocket",
+    background="Hongdae street in Seoul, warm afternoon light",
+    concept="street"
 )
 ```
 
@@ -626,10 +711,23 @@ With `both_sides=True`, `full_body_right` is added as a 4th body column.
 |   +-- ...
 |   +-- pose_sheet_20260302_150030.jpg          <-- grid composite
 +-- Luna_emoji_20260302_160000/                 <-- generate_chat_emoji
-|   +-- emoji_happy_20260302_160001_a1b2c3_raw.jpg
-|   +-- emoji_happy_20260302_160001_d4e5f6.png  <-- platform-sized
-|   +-- ...
-|   +-- emoji_preview_sheet_20260302_160100.jpg  <-- preview grid
+|   +-- sheet_01_20260302_160001.png             <-- raw 4x4 sprite sheet
+|   +-- sheet_02_20260302_160002.png             <-- raw 3x3 sheet (overflow)
+|   +-- telegram/                                <-- per-platform folders
+|   |   +-- happy_512.png
+|   |   +-- wink_512.png
+|   |   +-- ...
+|   +-- discord/
+|   |   +-- happy_128.png
+|   |   +-- ...
+|   +-- ico/                                     <-- Windows ICO (if include_ico=True)
+|   |   +-- happy.ico
+|   |   +-- ...
+|   +-- manifest.json                            <-- set metadata + per-emoji records
++-- Luna_anim_20260302_170000/                  <-- generate_animated_emoji
+|   +-- animated_happy_wink_512.gif
+|   +-- animated_happy_wink_128.gif
+|   +-- animated_happy_wink_512.webp
 +-- profiles/                                   <-- character profiles
 |   +-- siwol.yaml
 |   +-- claudie.yaml
@@ -695,6 +793,61 @@ Use `estimate_generation_cost` to check worst-case costs (all retries used) befo
 15. **Use character profiles** to avoid repeating appearance descriptions across sessions
 16. **Use `create_concept`** to group related generations into named campaigns or series
 17. **Use `suggest_outfits`** before `try_on_product` to explore catalog options first
+
+## Evaluation
+
+### Profile vs No-Profile Consistency
+
+| Aspect | Without profile | With profile |
+|--------|:---:|:---:|
+| Face consistency across shots | Variable | High |
+| Outfit detail accuracy | Manual per-call | Auto from YAML |
+| Hair/accessory persistence | Requires copy-paste | Single source of truth |
+| Cross-session consistency | Low (prompt drift) | High (YAML locked) |
+
+### suggest_outfits → try_on_product Pipeline
+
+Tested 2026-03-16 on Windows (catalog.db: 2,698 products, 8 categories):
+- `suggest_outfits(profile="siwol", concept="street")` → 3 proposals (A/B/C) with 4 items each
+- `try_on_product(product_ids=[...])` → 3 images (full_body + 2 face angles) + composite sheet
+- End-to-end latency: ~2 min (3 Gemini API calls)
+
+### Module Architecture (v0.5.0)
+
+| Module | Responsibility |
+|--------|---------------|
+| `server.py` | MCP tool registration, constants |
+| `image_io.py` | NAS paths, composites, emoji sheet slicing, platform export |
+| `generation.py` | Gemini API, safety retry, sheet prompt builder |
+| `catalog.py` | Product DB queries |
+| `emoji_sheet.py` | Sheet generation, grid layout, ICO export, animated GIF/WebP |
+
+## Roadmap
+
+### v0.5.0 — SD Emoji Sheet System (DONE)
+- [x] Sheet-based emoji generation (4x4 grid, 3x3 fallback, single API call per sheet)
+- [x] 3-tier expression system: base set + special extras + custom overrides
+- [x] Combo expression sets via `+` notation
+- [x] 7-platform export (Telegram, Discord, LINE, KakaoTalk, Slack, WhatsApp, Universal) + ICO
+- [x] `generate_animated_emoji` — GIF + animated WebP from DB emoji, no API calls
+- [x] DB tracking (`emoji_sets`, `emoji_items`, `emoji_animations`)
+- [x] `manifest.json` per emoji set
+- [x] `emoji_dictionary.md` — expression reference
+
+### v0.6.0 — Character Design Studio GUI
+- [ ] PySide6 desktop application
+- [ ] Preset selection/comparison UI with visual previews
+- [ ] Character profile editor (drag-drop, live preview)
+- [ ] Product catalog browser + try_on gallery
+- [ ] Design history timeline view
+- [ ] v0.5.0 MCP tools as backend API
+
+### Backlog
+- [ ] SNS pipeline (Atelier) camera_preset integration
+- [x] suggest_outfits → try_on_product full E2E flow test
+- [ ] Server modularization Phase 2 — move remaining data constants to dedicated files
+- [ ] Character relationship system (multi-character scenes)
+- [ ] Additional camera presets (cinematic, underwater, etc.)
 
 ## License
 

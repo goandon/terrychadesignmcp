@@ -55,5 +55,5 @@ generation_defaults:
   camera_preset: editorial
   output_mode: basic
   reference_images:
-  - /Volumes/NAS_Data/Claudie/google/character_design/references/claudie/face_front.jpg
-  - /Volumes/NAS_Data/Claudie/google/character_design/references/claudie/full_body_front.jpg
+  - /path/to/references/claudie/face_front.jpg
+  - /path/to/references/claudie/full_body_front.jpg
